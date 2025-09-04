@@ -9,7 +9,7 @@ from openai.types.responses import (ResponseFunctionToolCall,
                                     ResponseOutputItem, ResponseOutputMessage,
                                     ResponseOutputText, ResponseReasoningItem)
 from openai.types.responses.response_function_web_search import (
-    ActionFind, ActionOpenPage, ActionSearch, ResponseFunctionWebSearch)
+    ActionFind, ActionOpenPage, ActionSearch, McpCall, ResponseFunctionWebSearch)
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent)
 from openai.types.responses.tool import Tool
@@ -18,7 +18,7 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             Role, StreamableParser, SystemContent, TextContent,
                             ToolDescription, load_harmony_encoding)
 
-from vllm.entrypoints.openai.protocol import ResponseInputOutputItem
+from vllm.entrypoints.openai.protocol import ResponseInputOutputItem, MessageMetadata, ResponseOutputItemWithMetadata
 from vllm.utils import random_uuid
 
 REASONING_EFFORT = {
@@ -166,8 +166,7 @@ def render_for_completion(messages: list[Message]) -> list[int]:
         conversation, Role.ASSISTANT)
     return token_ids
 
-
-def parse_output_message(message: Message) -> list[ResponseOutputItem]:
+def parse_output_message_openai_api_behavior(message: Message) -> list[ResponseOutputItem]:
     """
     Parse a Harmony message into a list of output response items.
     """
@@ -268,9 +267,102 @@ def parse_output_message(message: Message) -> list[ResponseOutputItem]:
         raise ValueError(f"Unknown channel: {message.channel}")
     return output_items
 
+def parse_output_message_verbose(message: Message, previous_output_items: list[ResponseOutputItemWithMetadata]) -> list[ResponseOutputItemWithMetadata]:
+    output_items: list[ResponseOutputItem] = []
+    recipient = message.recipient
+    message_metadata = MessageMetadata(
+        author=str(message.author),
+        channel=message.channel,
+        recipient=message.recipient,
+        content_type=message.content_type
+    )
+    # When recipient is not None, it is always a tool call or tool call output
+    if recipient is not None:
+        # This means that it is a tool call output of some sort
+        if recipient == "assistant":
+            mcp_call = None
+            # TODO: Support parallel tool calls
+            for prev_response in reversed(previous_output_items):
+                item = prev_response.item
+                if isinstance(item, McpCall):
+                    mcp_call = item
+                    break
+            if mcp_call is None:
+                raise ValueError("Received a tool call output without a prior tool call")
+            mcp_call.output = message.content[0].text_content
+            # No need to append any message since we are modifying in place
+        # Currently assuming that any tool call recipient that starts with functions is executed client side, so is a ResponseFunctionToolCall
+        elif recipient.startswith('functions'):
+            function_name = recipient.split(".")[-1]
+            for content in message.content:
+                random_id = random_uuid()
+                response_item = ResponseFunctionToolCall(
+                    arguments=content.text,
+                    call_id=f"call_{random_id}",
+                    type="function_call",
+                    name=function_name,
+                    id=f"ft_{random_id}",
+                )
+                output_items.append(response_item)
+        else:
+            for content in message.content:
+                random_id = random_uuid()
+                response_item = McpCall(
+                    arguments=content.text,
+                    id=f"call_{random_id}",
+                    type="mcp_call",
+                    name=recipient,
+                    server_label=recipient.split('.')[0]
+                )
+                output_items.append(response_item)
+    # Any messages without recipient to these channels is a reasoning message
+    elif message.channel == "analysis" or message.channel == "commentary":
+        for content in message.content:
+            reasoning_item = ResponseReasoningItem(
+                id=f"rs_{random_uuid()}",
+                summary=[],
+                type="reasoning",
+                content=[
+                    ResponseReasoningTextContent(text=content.text,
+                                                 type="reasoning_text")
+                ],
+                status=None,
+            )
+            output_items.append(reasoning_item)
+    # Final channel means this is not reasoning and is a message to show to the user
+    elif message.channel == "final":
+        contents = []
+        for content in message.content:
+            output_text = ResponseOutputText(
+                text=content.text,
+                annotations=[],  # TODO
+                type="output_text",
+                logprobs=None,  # TODO
+            )
+            contents.append(output_text)
+        text_item = ResponseOutputMessage(
+            id=f"msg_{random_uuid()}",
+            content=contents,
+            role=message.author.role,
+            status="completed",
+            type="message",
+        )
+        output_items.append(text_item)
+    else:
+        raise ValueError(f"Unknown channel: {message.channel}")
+
+    # Convert each ResponseOutputItem to ResponseOutputItemWithMetadata
+    result = []
+    for item in output_items:
+        result.append(ResponseOutputItemWithMetadata(
+            item=item,
+            metadata=message_metadata
+        ))
+    return result
+
 
 def parse_remaining_state(
-        parser: StreamableParser) -> list[ResponseOutputItem]:
+        parser: StreamableParser, verbose: bool = False) -> Union[list[ResponseOutputItem], list[ResponseOutputItemWithMetadata]]:
     if not parser.current_content:
         return []
     if parser.current_role != Role.ASSISTANT:
@@ -279,6 +371,8 @@ def parse_remaining_state(
     if (current_recipient is not None
             and current_recipient.startswith("browser.")):
         return []
+
+    output_items = []
 
     if parser.current_channel == "analysis":
         reasoning_item = ResponseReasoningItem(
@@ -291,7 +385,7 @@ def parse_remaining_state(
             ],
             status=None,
         )
-        return [reasoning_item]
+        output_items = [reasoning_item]
     elif parser.current_channel == "final":
         output_text = ResponseOutputText(
             text=parser.current_content,
@@ -306,8 +400,17 @@ def parse_remaining_state(
             status="completed",
             type="message",
         )
-        return [text_item]
-    return []
+        output_items = [text_item]
+    if verbose:
+        message_metadata = MessageMetadata(author=Author(role=parser.current_role),
+            channel=parser.current_channel,
+            recipient=parser.current_recipient,
+            content_type=parser.current_content_type)
+        return [ResponseOutputItemWithMetadata(
+            item=output_items[0],
+            metadata=message_metadata
+        )]
+    return output_items
 
 
 def get_stop_tokens_for_assistant_actions() -> list[int]:

@@ -41,7 +41,7 @@ from vllm.entrypoints.context import (ConversationContext, HarmonyContext,
                                       SimpleContext, StreamingHarmonyContext)
 from vllm.entrypoints.harmony_utils import (
     get_developer_message, get_stop_tokens_for_assistant_actions,
-    get_system_message, get_user_message, parse_output_message,
+    get_system_message, get_user_message, parse_output_message_openai_api_behavior, parse_output_message_verbose,
     parse_remaining_state, parse_response_input, render_for_completion)
 from vllm.entrypoints.logger import RequestLogger
 # yapf conflicts with isort for this block
@@ -89,6 +89,7 @@ class OpenAIServingResponses(OpenAIServing):
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
         log_error_stack: bool = False,
+        enable_openai_api_behavior: bool = True
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -103,6 +104,8 @@ class OpenAIServingResponses(OpenAIServing):
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
         self.enable_log_outputs = enable_log_outputs
+        # This flag is used to determine whether to match OpenAI API behavior or return reasoning metadata and more tool information
+        self.enable_openai_api_behavior = enable_openai_api_behavior
 
         self.reasoning_parser: Optional[Callable[[AnyTokenizer],
                                                  ReasoningParser]] = None
@@ -617,9 +620,12 @@ class OpenAIServingResponses(OpenAIServing):
         output_items = []
         num_init_messages = context.num_init_messages
         for msg in context.messages[num_init_messages:]:
-            output_items.extend(parse_output_message(msg))
+            if self.enable_openai_api_behavior:
+                output_items.extend(parse_output_message_openai_api_behavior(msg))
+            else:
+                output_items.extend(parse_output_message_verbose(msg, previous_output_items=output_items))
         # Handle the generation stopped in the middle (if any).
-        last_items = parse_remaining_state(context.parser)
+        last_items = parse_remaining_state(context.parser, self.enable_openai_api_behavior)
         if last_items:
             output_items.extend(last_items)
         return output_items
