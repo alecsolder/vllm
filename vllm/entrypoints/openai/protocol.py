@@ -1843,6 +1843,16 @@ class ResponseUsage(OpenAIBaseModel):
     output_tokens_details: OutputTokensDetails
     total_tokens: int
 
+class MessageMetadata(BaseModel):
+    author: Optional[str] = None
+    channel: Optional[str] = None
+    recipient: Optional[str] = None
+    content_type: Optional[str] = None
+
+class ResponseOutputItemWithMetadata(BaseModel):
+    item: ResponseOutputItem
+    metadata: MessageMetadata
+
 
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{random_uuid()}")
@@ -1853,7 +1863,7 @@ class ResponsesResponse(OpenAIBaseModel):
     metadata: Optional[Metadata] = None
     model: str
     object: Literal["response"] = "response"
-    output: list[ResponseOutputItem]
+    output: Union[list[ResponseOutputItem], list[ResponseOutputItemWithMetadata]]
     parallel_tool_calls: bool
     temperature: float
     tool_choice: ToolChoice
@@ -1880,7 +1890,7 @@ class ResponsesResponse(OpenAIBaseModel):
         sampling_params: SamplingParams,
         model_name: str,
         created_time: int,
-        output: list[ResponseOutputItem],
+        output: Union[list[ResponseOutputItem], list[ResponseOutputItemWithMetadata]],
         status: ResponseStatus,
         usage: Optional[ResponseUsage] = None,
     ) -> "ResponsesResponse":
@@ -2089,7 +2099,7 @@ class DetokenizeResponse(OpenAIBaseModel):
 
 class TokenizerInfoResponse(OpenAIBaseModel):
     """
-    Response containing tokenizer configuration 
+    Response containing tokenizer configuration
     equivalent to tokenizer_config.json
     """
 
@@ -2179,7 +2189,7 @@ class TranscriptionRequest(OpenAIBaseModel):
     to_language: Optional[str] = None
     """The language of the output audio we transcribe to.
 
-    Please note that this is not currently used by supported models at this 
+    Please note that this is not currently used by supported models at this
     time, but it is a placeholder for future use, matching translation api.
     """
 
