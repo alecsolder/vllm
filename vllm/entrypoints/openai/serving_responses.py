@@ -676,31 +676,7 @@ class OpenAIServingResponses(OpenAIServing):
         prev_response: Optional[ResponsesResponse],
     ) -> list[OpenAIHarmonyMessage]:
         messages: list[OpenAIHarmonyMessage] = []
-        if prev_response is None:
-            # New conversation.
-            reasoning_effort = (request.reasoning.effort
-                                if request.reasoning else None)
-            tool_types = [tool.type for tool in request.tools]
-            enable_browser = ("web_search_preview" in tool_types
-                              and self.tool_server is not None
-                              and self.tool_server.has_tool("browser"))
-            enable_code_interpreter = ("code_interpreter" in tool_types
-                                       and self.tool_server is not None
-                                       and self.tool_server.has_tool("python"))
-            sys_msg = get_system_message(
-                reasoning_effort=reasoning_effort,
-                browser_description=self.tool_server.get_tool_description(
-                    "browser")
-                if enable_browser and self.tool_server is not None else None,
-                python_description=self.tool_server.get_tool_description(
-                    "python") if enable_code_interpreter
-                and self.tool_server is not None else None,
-            )
-            messages.append(sys_msg)
-            dev_msg = get_developer_message(request.instructions,
-                                            request.tools)
-            messages.append(dev_msg)
-        else:
+        if prev_response is not None:
             # Continue the previous conversation.
             # FIXME(woosuk): Currently, request params like reasoning and
             # instructions are ignored.
@@ -726,6 +702,32 @@ class OpenAIServingResponses(OpenAIServing):
                         if msg.channel != "analysis":
                             prev_msgs.append(msg)
             messages.extend(prev_msgs)
+        elif request.previous_response_harmony_messages is not None:
+            messages.extend(request.previous_response_harmony_messages)
+        else:
+            # New conversation.
+            reasoning_effort = (request.reasoning.effort
+                                if request.reasoning else None)
+            tool_types = [tool.type for tool in request.tools]
+            enable_browser = ("web_search_preview" in tool_types
+                              and self.tool_server is not None
+                              and self.tool_server.has_tool("browser"))
+            enable_code_interpreter = ("code_interpreter" in tool_types
+                                       and self.tool_server is not None
+                                       and self.tool_server.has_tool("python"))
+            sys_msg = get_system_message(
+                reasoning_effort=reasoning_effort,
+                browser_description=self.tool_server.get_tool_description(
+                    "browser")
+                if enable_browser and self.tool_server is not None else None,
+                python_description=self.tool_server.get_tool_description(
+                    "python") if enable_code_interpreter
+                and self.tool_server is not None else None,
+            )
+            messages.append(sys_msg)
+            dev_msg = get_developer_message(request.instructions,
+                                            request.tools)
+            messages.append(dev_msg)
         # Append the new input.
         # Reponses API supports simple text inputs without chat format.
         if isinstance(request.input, str):

@@ -275,6 +275,9 @@ class ResponsesRequest(OpenAIBaseModel):
     model: Optional[str] = None
     parallel_tool_calls: Optional[bool] = True
     previous_response_id: Optional[str] = None
+    # This can be used when the store is disabled but you want to
+    # be able to continue a Responses API thread
+    previous_response_harmony_messages: Optional[list[Message]] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None
     service_tier: Literal["auto", "default", "flex", "scale",
@@ -2098,7 +2101,7 @@ class DetokenizeResponse(OpenAIBaseModel):
 
 class TokenizerInfoResponse(OpenAIBaseModel):
     """
-    Response containing tokenizer configuration 
+    Response containing tokenizer configuration
     equivalent to tokenizer_config.json
     """
 
