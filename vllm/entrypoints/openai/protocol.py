@@ -378,6 +378,27 @@ class ResponsesRequest(OpenAIBaseModel):
             self.include,
             list) and "message.output_text.logprobs" in self.include
 
+    @field_validator("previous_response_harmony_messages", mode="before")
+    @classmethod
+    def deserialize_harmony_messages(cls, v):
+        """Convert incoming JSON dictionaries to Message objects."""
+        if v is None:
+            return v
+        if isinstance(v, list):
+            result = []
+            for item in v:
+                if isinstance(item, dict):
+                    # Convert dictionary to Message object using from_dict
+                    result.append(Message.from_dict(item))
+                elif isinstance(item, Message):
+                    # Already a Message object
+                    result.append(item)
+                else:
+                    raise ValueError(
+                        f"Invalid harmony message type: {type(item)}")
+            return result
+        raise ValueError(f"Invalid type for harmony messages: {type(v)}")
+
     @model_validator(mode="before")
     def validate_background(cls, data):
         if not data.get("background"):
@@ -1853,8 +1874,8 @@ class ResponsesResponse(OpenAIBaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # These are populated when the env flag
     # VLLM_RESPONSES_API_ENABLE_HARMONY_MESSAGES_OUTPUT is set
-    input_harmony_messages: Optional[list[Message]] = None
-    output_harmony_messages: Optional[list[Message]] = None
+    input_harmony_messages: Optional[list[dict[str, Any]]] = None
+    output_harmony_messages: Optional[list[dict[str, Any]]] = None
     # error: Optional[ResponseError] = None
     # incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
@@ -1898,8 +1919,12 @@ class ResponsesResponse(OpenAIBaseModel):
             id=request.request_id,
             created_at=created_time,
             instructions=request.instructions,
-            input_harmony_messages=input_harmony_messages,
-            output_harmony_messages=output_harmony_messages,
+            input_harmony_messages=[
+                msg.to_dict() for msg in input_harmony_messages
+            ] if input_harmony_messages else None,
+            output_harmony_messages=[
+                msg.to_dict() for msg in output_harmony_messages
+            ] if output_harmony_messages else None,
             metadata=request.metadata,
             model=model_name,
             output=output,

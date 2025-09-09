@@ -444,7 +444,7 @@ class OpenAIServingResponses(OpenAIServing):
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
-            if envs.VLLM_GPT_OSS_USE_CONTAINER_TOOL:
+            if envs.VLLM_RESPONSES_API_ENABLE_HARMONY_MESSAGES_OUTPUT:
                 # TODO: Handle leftover parser state?
                 input_harmony_messages = context.input_messages
                 # .messages contains input and output, so just get the output

@@ -168,6 +168,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = False
     VLLM_TUNED_CONFIG_FOLDER: Optional[str] = None
     VLLM_DISABLE_PAD_FOR_CUDAGRAPH: bool = False
+    VLLM_RESPONSES_API_ENABLE_HARMONY_MESSAGES_OUTPUT: bool = False
 
 
 def get_default_cache_root():
