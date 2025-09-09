@@ -168,6 +168,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = False
     VLLM_TUNED_CONFIG_FOLDER: Optional[str] = None
     VLLM_DISABLE_PAD_FOR_CUDAGRAPH: bool = False
+    VLLM_RESPONSES_API_ENABLE_HARMONY_MESSAGES_OUTPUT: bool = False
 
 
 def get_default_cache_root():
@@ -1199,6 +1200,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TUNED_CONFIG_FOLDER":
     lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),
 
+    # Whether to enable outputting Harmony messages on the
+    # Responses API response object
+    "VLLM_RESPONSES_API_ENABLE_HARMONY_MESSAGES_OUTPUT":
+    lambda: bool(int(
+        os.getenv("VLLM_RESPONSES_API_ENABLE_HARMONY_MESSAGES_OUTPUT",
+        "0"))),
 }
 
 # --8<-- [end:env-vars-definition]
