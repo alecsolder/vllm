@@ -9,7 +9,6 @@ from openai import OpenAI
 from ...utils import RemoteOpenAIServer
 
 MODEL_NAME = "openai/gpt-oss-20b"
-MODEL_NAME = "/home/alecs/local/checkpoints/gpt-oss-20b"
 
 
 @pytest.fixture(scope="module")
