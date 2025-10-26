@@ -212,3 +212,107 @@ async def test_memory_mcp_with_headers(memory_custom_client, model_name: str):
     # Memory isolation: key from session-1 should not be in session-2
     assert mcp_call_output is not None, "Should have McpCall with output"
     assert "Key 'isolated_key' not found in memory space 'session-2'" in mcp_call_output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_memory_mcp_conversation_continuation_with_store(
+    memory_custom_client, model_name: str
+):
+    """Test conversation continuation with MCP tools using store=True.
+
+    This test demonstrates:
+    1. First request: Store a value in memory with store=True
+    2. Second request: Use previous_response_id for stateful continuation
+    3. Verify that conversation context is maintained across requests
+    """
+    # First request: Store a value in memory with store=True
+    response1 = await memory_custom_client.responses.create(
+        model=model_name,
+        instructions=(
+            "You must use the memory.store tool to store data. "
+            "Never simulate tool execution."
+        ),
+        input="Store the key 'favorite_food' with value 'pizza'",
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "memory",
+                "server_url": "http://unused",
+                "headers": {"x-memory-id": "store-continuation-test"},
+            }
+        ],
+        store=True,
+        extra_body={"enable_response_messages": True},
+    )
+
+    assert response1.status == "completed"
+    assert response1.usage.output_tokens_details.tool_output_tokens > 0
+
+    # Verify first response has MCP calls
+    from openai.types.responses.response_output_item import McpCall
+
+    mcp_calls_1 = [
+        item for item in response1.output if isinstance(item, McpCall)
+    ]
+    assert len(mcp_calls_1) > 0, "First request should have MCP calls"
+
+    # Verify store was called
+    store_call = next((c for c in mcp_calls_1 if c.name == "store"), None)
+    assert store_call is not None, "Should have called store tool"
+    assert store_call.output is not None, "Store call should have output"
+
+    # Second request: Continue conversation using previous_response_id
+    # With store=True, we can use previous_response_id instead of manually
+    # building history
+    response2 = await memory_custom_client.responses.create(
+        model=model_name,
+        instructions=(
+            "You must use the memory.retrieve tool to retrieve data. "
+            "Never simulate tool execution."
+        ),
+        input="What food did I just store? Retrieve it from memory.",
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "memory",
+                "server_url": "http://unused",
+                "headers": {"x-memory-id": "store-continuation-test"},
+            }
+        ],
+        previous_response_id=response1.id,
+        extra_body={"enable_response_messages": True},
+    )
+
+    assert response2.status == "completed"
+    assert response2.usage.output_tokens_details.tool_output_tokens > 0
+
+    # Verify second response has MCP calls
+    mcp_calls_2 = [
+        item for item in response2.output if isinstance(item, McpCall)
+    ]
+    assert len(mcp_calls_2) > 0, "Second request should have MCP calls"
+
+    # Verify retrieve was called
+    retrieve_call = next((c for c in mcp_calls_2 if c.name == "retrieve"), None)
+    assert retrieve_call is not None, "Should have called retrieve tool"
+    assert retrieve_call.output is not None, "Retrieve call should have output"
+
+    # Verify the retrieved value matches what we stored
+    assert "pizza" in retrieve_call.output.lower(), (
+        "Retrieved value should contain 'pizza'"
+    )
+
+    # Verify input messages include conversation history
+    assert len(response2.input_messages) > len(response1.input_messages), (
+        "Second request should have more input messages (conversation history)"
+    )
+
+    # Verify there are 2 user messages (original + follow-up)
+    user_messages = [
+        msg for msg in response2.input_messages
+        if msg["author"]["role"] == "user"
+    ]
+    assert len(user_messages) == 2, (
+        "Second request should have 2 user messages when using previous_response_id"
+    )

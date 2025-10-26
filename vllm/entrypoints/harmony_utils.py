@@ -317,7 +317,14 @@ def parse_response_input(
         if isinstance(content, str):
             msg = Message.from_role_and_content(role, content)
         else:
-            contents = [TextContent(text=c["text"]) for c in content]
+            # Extract text from content items (may be dicts or objects)
+            contents = []
+            for c in content:
+                if isinstance(c, dict):
+                    text = c.get("text", "")
+                else:
+                    text = getattr(c, "text", "")
+                contents.append(TextContent(text=text))
             msg = Message.from_role_and_contents(role, contents)
         if role == "assistant":
             msg = msg.with_channel("final")
@@ -475,6 +482,7 @@ def parse_output_message(
 
         if matching_call:
             matching_call.output = message.content[0].text if message.content else None
+            matching_call.status = "completed"
         else:
             # We should error here, but it wouldn't make much sense
             # before we switch to using McpCall for all tool calls + output
@@ -505,6 +513,7 @@ def parse_output_message(
                 arguments=content.text,
                 output=None,
                 error=None,
+                status="in_progress",
             )
             output_items.append(mcp_call)
     elif channel == "analysis" or channel == "commentary":
@@ -523,7 +532,7 @@ def parse_output_message(
                 ResponseReasoningTextContent(text=content.text, type="reasoning_text")
             ],
             encrypted_content=channel,
-            status=None,
+            status="completed",
         )
         output_items.append(reasoning_item)
     elif channel == "final":
@@ -533,7 +542,8 @@ def parse_output_message(
                 text=content.text,
                 annotations=[],  # TODO
                 type="output_text",
-                logprobs=None,  # TODO
+                # Empty list for compatibility with ResponseOutputTextParam
+                logprobs=[],
             )
             contents.append(output_text)
         text_item = ResponseOutputMessage(
@@ -579,7 +589,7 @@ def parse_remaining_state(parser: StreamableParser) -> list[ResponseOutputItem]:
             text=parser.current_content,
             annotations=[],  # TODO
             type="output_text",
-            logprobs=None,  # TODO
+            logprobs=[],  # Empty list for compatibility with ResponseOutputTextParam
         )
         text_item = ResponseOutputMessage(
             id=f"msg_{random_uuid()}",
