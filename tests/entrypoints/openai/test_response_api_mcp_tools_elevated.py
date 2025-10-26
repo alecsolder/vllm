@@ -8,6 +8,7 @@ import pytest_asyncio
 
 from ...utils import RemoteOpenAIServer, find_free_port
 from .memory_mcp_server import start_test_server
+from .responses_utils import verify_tool_on_channel
 
 MODEL_NAME = "openai/gpt-oss-20b"
 
@@ -108,28 +109,7 @@ async def test_memory_mcp_elevated(memory_elevated_client, model_name: str):
     )
 
     # Verify output messages: Tool calls and responses on analysis channel
-    tool_call_found = False
-    tool_response_found = False
-    for message in response.output_messages:
-        recipient = message.get("recipient")
-        if recipient and recipient.startswith("memory."):
-            tool_call_found = True
-            assert message.get("channel") == "analysis", (
-                "Tool call should be on analysis channel"
-            )
-        author = message.get("author", {})
-        if (
-            author.get("role") == "tool"
-            and author.get("name")
-            and author.get("name").startswith("memory.")
-        ):
-            tool_response_found = True
-            assert message.get("channel") == "analysis", (
-                "Tool response should be on analysis channel"
-            )
-
-    assert tool_call_found, "Should have found at least one memory tool call"
-    assert tool_response_found, "Should have found at least one memory tool response"
+    verify_tool_on_channel(response.output_messages, "memory.", "analysis")
 
     # Verify functional correctness
     output_text = ""

@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 from ...utils import RemoteOpenAIServer
+from .responses_utils import build_conversation_from_response, verify_tool_on_channel
 
 MODEL_NAME = "openai/gpt-oss-20b"
 
@@ -104,28 +105,7 @@ async def test_memory_mcp_custom(memory_custom_client, model_name: str):
     assert len(developer_messages) > 0, "Developer message expected for custom tools"
 
     # Verify output messages: Tool calls and responses on commentary channel
-    tool_call_found = False
-    tool_response_found = False
-    for message in response.output_messages:
-        recipient = message.get("recipient")
-        if recipient and recipient.startswith("memory."):
-            tool_call_found = True
-            assert message.get("channel") == "commentary", (
-                "Tool call should be on commentary channel"
-            )
-        author = message.get("author", {})
-        if (
-            author.get("role") == "tool"
-            and author.get("name")
-            and author.get("name").startswith("memory.")
-        ):
-            tool_response_found = True
-            assert message.get("channel") == "commentary", (
-                "Tool response should be on commentary channel"
-            )
-
-    assert tool_call_found, "Should have found at least one memory tool call"
-    assert tool_response_found, "Should have found at least one memory tool response"
+    verify_tool_on_channel(response.output_messages, "memory.", "commentary")
 
     # Verify McpCall items (tool invocations)
     from openai.types.responses.response_output_item import McpCall
@@ -252,9 +232,7 @@ async def test_memory_mcp_conversation_continuation_with_store(
     # Verify first response has MCP calls
     from openai.types.responses.response_output_item import McpCall
 
-    mcp_calls_1 = [
-        item for item in response1.output if isinstance(item, McpCall)
-    ]
+    mcp_calls_1 = [item for item in response1.output if isinstance(item, McpCall)]
     assert len(mcp_calls_1) > 0, "First request should have MCP calls"
 
     # Verify store was called
@@ -288,9 +266,7 @@ async def test_memory_mcp_conversation_continuation_with_store(
     assert response2.usage.output_tokens_details.tool_output_tokens > 0
 
     # Verify second response has MCP calls
-    mcp_calls_2 = [
-        item for item in response2.output if isinstance(item, McpCall)
-    ]
+    mcp_calls_2 = [item for item in response2.output if isinstance(item, McpCall)]
     assert len(mcp_calls_2) > 0, "Second request should have MCP calls"
 
     # Verify retrieve was called
@@ -310,11 +286,109 @@ async def test_memory_mcp_conversation_continuation_with_store(
 
     # Verify there are 2 user messages (original + follow-up)
     user_messages = [
-        msg for msg in response2.input_messages
-        if msg["author"]["role"] == "user"
+        msg for msg in response2.input_messages if msg["author"]["role"] == "user"
     ]
     assert len(user_messages) == 2, (
         "Second request should have 2 user messages when using previous_response_id"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_memory_mcp_conversation_continuation_manual_history(
+    memory_custom_client, model_name: str
+):
+    """Test conversation continuation with MCP tools using manual history.
+
+    This test demonstrates:
+    1. First request: Store a value in memory (without store=True)
+    2. Second request: Manually pass input_messages + output_messages as history
+    3. Verify that conversation context is maintained across requests
+    """
+    # First request: Store a value in memory without store=True
+    response1 = await memory_custom_client.responses.create(
+        model=model_name,
+        instructions=(
+            "You must use the memory.store tool to store data. "
+            "Never simulate tool execution."
+        ),
+        input="Store the key 'favorite_color' with value 'blue'",
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "memory",
+                "server_url": "http://unused",
+                "headers": {"x-memory-id": "manual-continuation-test"},
+            }
+        ],
+        extra_body={"enable_response_messages": True},
+    )
+
+    assert response1.status == "completed"
+    assert response1.usage.output_tokens_details.tool_output_tokens > 0
+
+    # Verify first response has MCP calls
+    from openai.types.responses.response_output_item import McpCall
+
+    mcp_calls_1 = [item for item in response1.output if isinstance(item, McpCall)]
+    assert len(mcp_calls_1) > 0, "First request should have MCP calls"
+
+    # Verify store was called
+    store_call = next((c for c in mcp_calls_1 if c.name == "store"), None)
+    assert store_call is not None, "Should have called store tool"
+    assert store_call.output is not None, "Store call should have output"
+
+    # Second request: Manually build conversation history
+    conversation_history = build_conversation_from_response(
+        response1, "What color did I just store? Retrieve it from memory."
+    )
+
+    response2 = await memory_custom_client.responses.create(
+        model=model_name,
+        instructions=(
+            "You must use the memory.retrieve tool to retrieve data. "
+            "Never simulate tool execution."
+        ),
+        input=conversation_history,
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "memory",
+                "server_url": "http://unused",
+                "headers": {"x-memory-id": "manual-continuation-test"},
+            }
+        ],
+        extra_body={"enable_response_messages": True},
+    )
+
+    assert response2.status == "completed"
+    assert response2.usage.output_tokens_details.tool_output_tokens > 0
+
+    # Verify second response has MCP calls
+    mcp_calls_2 = [item for item in response2.output if isinstance(item, McpCall)]
+    assert len(mcp_calls_2) > 0, "Second request should have MCP calls"
+
+    # Verify retrieve was called
+    retrieve_call = next((c for c in mcp_calls_2 if c.name == "retrieve"), None)
+    assert retrieve_call is not None, "Should have called retrieve tool"
+    assert retrieve_call.output is not None, "Retrieve call should have output"
+
+    # Verify the retrieved value matches what we stored
+    assert "blue" in retrieve_call.output.lower(), (
+        "Retrieved value should contain 'blue'"
+    )
+
+    # Verify input messages include conversation history
+    assert len(response2.input_messages) > len(response1.input_messages), (
+        "Second request should have more input messages (conversation history)"
+    )
+
+    # Verify there are 2 user messages (original + follow-up)
+    user_messages = [
+        msg for msg in response2.input_messages if msg["author"]["role"] == "user"
+    ]
+    assert len(user_messages) == 2, (
+        "Second request should have 2 user messages when using manual history"
     )
 
 
@@ -356,9 +430,7 @@ async def test_memory_mcp_then_switch_to_function_tool(
     # Verify first response has MCP calls
     from openai.types.responses.response_output_item import McpCall
 
-    mcp_calls_1 = [
-        item for item in response1.output if isinstance(item, McpCall)
-    ]
+    mcp_calls_1 = [item for item in response1.output if isinstance(item, McpCall)]
     assert len(mcp_calls_1) > 0, "First request should have MCP calls"
 
     # Second request: Switch to function tool (independent task)
@@ -369,9 +441,7 @@ async def test_memory_mcp_then_switch_to_function_tool(
             {
                 "type": "function",
                 "name": "get_weather",
-                "description": (
-                    "Get current temperature for a city in celsius."
-                ),
+                "description": ("Get current temperature for a city in celsius."),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -397,9 +467,7 @@ async def test_memory_mcp_then_switch_to_function_tool(
     from openai.types.responses import ResponseFunctionToolCall
 
     function_calls = [
-        item
-        for item in response2.output
-        if isinstance(item, ResponseFunctionToolCall)
+        item for item in response2.output if isinstance(item, ResponseFunctionToolCall)
     ]
 
     # The test passes if either:
@@ -413,6 +481,4 @@ async def test_memory_mcp_then_switch_to_function_tool(
         )
         if weather_call:
             args = json.loads(weather_call.arguments)
-            assert "london" in args["city"].lower(), (
-                "Function call should reference London"
-            )
+            assert "london" in args["city"].lower()

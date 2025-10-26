@@ -15,6 +15,7 @@ from openai_harmony import (
 from vllm.entrypoints.openai.protocol import serialize_message, serialize_messages
 
 from ...utils import RemoteOpenAIServer
+from .responses_utils import verify_tool_on_channel
 
 MODEL_NAME = "openai/gpt-oss-20b"
 
@@ -455,28 +456,7 @@ async def test_code_interpreter(client: OpenAI, model_name: str):
     assert response.usage.output_tokens_details.tool_output_tokens > 0
 
     # Verify output messages: Tool calls and responses on analysis channel
-    tool_call_found = False
-    tool_response_found = False
-    for message in response.output_messages:
-        recipient = message.get("recipient")
-        if recipient and recipient.startswith("python"):
-            tool_call_found = True
-            assert message.get("channel") == "analysis", (
-                "Tool call should be on analysis channel"
-            )
-        author = message.get("author", {})
-        if (
-            author.get("role") == "tool"
-            and author.get("name")
-            and author.get("name").startswith("python")
-        ):
-            tool_response_found = True
-            assert message.get("channel") == "analysis", (
-                "Tool response should be on analysis channel"
-            )
-
-    assert tool_call_found, "Should have found at least one Python tool call"
-    assert tool_response_found, "Should have found at least one Python tool response"
+    verify_tool_on_channel(response.output_messages, "python", "analysis")
 
 
 def get_weather(latitude, longitude):
