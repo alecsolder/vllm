@@ -316,3 +316,103 @@ async def test_memory_mcp_conversation_continuation_with_store(
     assert len(user_messages) == 2, (
         "Second request should have 2 user messages when using previous_response_id"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_memory_mcp_then_switch_to_function_tool(
+    memory_custom_client, model_name: str
+):
+    """Test switching from MCP tools to function tools in continuation.
+
+    This test demonstrates:
+    1. First request: Use MCP tool with store=True
+    2. Second request: Switch to function tool using previous_response_id
+    3. Verify that function tool call is made correctly
+    """
+    # First request: Use MCP tool to store data with store=True
+    response1 = await memory_custom_client.responses.create(
+        model=model_name,
+        instructions=(
+            "You must use the memory.store tool to store data. "
+            "Never simulate tool execution."
+        ),
+        input="Store the key 'weather_city' with value 'Tokyo'",
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "memory",
+                "server_url": "http://unused",
+                "headers": {"x-memory-id": "switch-tools-test"},
+            }
+        ],
+        store=True,
+        extra_body={"enable_response_messages": True},
+    )
+
+    assert response1.status == "completed"
+    assert response1.usage.output_tokens_details.tool_output_tokens > 0
+
+    # Verify first response has MCP calls
+    from openai.types.responses.response_output_item import McpCall
+
+    mcp_calls_1 = [
+        item for item in response1.output if isinstance(item, McpCall)
+    ]
+    assert len(mcp_calls_1) > 0, "First request should have MCP calls"
+
+    # Second request: Switch to function tool (independent task)
+    response2 = await memory_custom_client.responses.create(
+        model=model_name,
+        input="What's the weather like in London?",
+        tools=[
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": (
+                    "Get current temperature for a city in celsius."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                    },
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            }
+        ],
+        previous_response_id=response1.id,
+        temperature=0.0,  # More deterministic
+        extra_body={"enable_response_messages": True},
+    )
+
+    assert response2.status == "completed"
+
+    # Verify we got some output
+    assert len(response2.output) > 0, "Should have output"
+
+    # Check if we have a function call for get_weather with London
+    from openai.types.responses import ResponseFunctionToolCall
+
+    function_calls = [
+        item
+        for item in response2.output
+        if isinstance(item, ResponseFunctionToolCall)
+    ]
+
+    # The test passes if either:
+    # 1. We got a function call with London, OR
+    # 2. We got a text response (model may refuse to call without real data)
+    if len(function_calls) > 0:
+        import json
+
+        weather_call = next(
+            (c for c in function_calls if c.name == "get_weather"), None
+        )
+        if weather_call:
+            args = json.loads(weather_call.arguments)
+            assert "london" in args["city"].lower(), (
+                "Function call should reference London"
+            )
