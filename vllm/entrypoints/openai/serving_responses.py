@@ -556,6 +556,8 @@ class OpenAIServingResponses(OpenAIServing):
             if request.enable_response_messages:
                 input_messages = context.messages[: context.num_init_messages]
                 output_messages = context.messages[context.num_init_messages :]
+                print(input_messages)
+                print(output_messages)
             num_tool_output_tokens = context.num_tool_output_tokens
             if len(output) > 0:
                 if context.finish_reason == "length":
@@ -891,6 +893,21 @@ class OpenAIServingResponses(OpenAIServing):
         if isinstance(request.input, str):
             messages.append(get_user_message(request.input))
         else:
+            # Validate that both instructions and system message are not provided
+            if request.instructions:
+                has_system_msg = any(
+                    isinstance(msg, dict)
+                    and msg.get("role") == "system"
+                    and (msg.get("type") is None or msg.get("type") == "message")
+                    for msg in request.input
+                )
+                if has_system_msg:
+                    raise ValueError(
+                        "Cannot provide both 'instructions' parameter and "
+                        "system message in 'input'. Use 'instructions' "
+                        "parameter for system-level instructions."
+                    )
+
             if prev_response is not None:
                 prev_outputs = copy(prev_response.output)
             else:

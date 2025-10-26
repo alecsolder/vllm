@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import datetime
-import json
 from collections.abc import Iterable, Sequence
 from typing import Literal
 
@@ -12,12 +11,6 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseReasoningItem,
-)
-from openai.types.responses.response_function_web_search import (
-    ActionFind,
-    ActionOpenPage,
-    ActionSearch,
-    ResponseFunctionWebSearch,
 )
 from openai.types.responses.response_output_item import McpCall
 from openai.types.responses.response_reasoning_item import (
@@ -317,18 +310,14 @@ def parse_response_input(
     if "type" not in response_msg or response_msg["type"] == "message":
         role = response_msg["role"]
         content = response_msg["content"]
+        # Convert system messages to user messages in input
+        # (instructions parameter should be used for system-level instructions instead)
         if role == "system":
-            # User is trying to set a system message. Change it to:
-            # <|start|>developer<|message|># Instructions
-            # {instructions}<|end|>
-            role = "developer"
-            text_prefix = "Instructions:\n"
-        else:
-            text_prefix = ""
+            role = "user"
         if isinstance(content, str):
-            msg = Message.from_role_and_content(role, text_prefix + content)
+            msg = Message.from_role_and_content(role, content)
         else:
-            contents = [TextContent(text=text_prefix + c["text"]) for c in content]
+            contents = [TextContent(text=c["text"]) for c in content]
             msg = Message.from_role_and_contents(role, contents)
         if role == "assistant":
             msg = msg.with_channel("final")
@@ -343,20 +332,46 @@ def parse_response_input(
                 call_response = prev_response
                 break
         if call_response is None:
-            raise ValueError(f"No call message found for {call_id}")
+            raise ValueError(
+                f"No function call message found for {call_id}", response_msg
+            )
         msg = Message.from_author_and_content(
             Author.new(Role.TOOL, f"functions.{call_response.name}"),
             response_msg["output"],
         )
+        msg = msg.with_channel("commentary")
     elif response_msg["type"] == "reasoning":
         content = response_msg["content"]
-        assert len(content) == 1
-        msg = Message.from_role_and_content(Role.ASSISTANT, content[0]["text"])
+        text = ""
+        if len(content) != 1:
+            text = "\n".join([c["text"] for c in content])
+        else:
+            text = content[0]["text"]
+        msg = Message.from_role_and_content(Role.ASSISTANT, text)
+        # Hack to make sure we keep track of channels for reasoning
+        # Default to "analysis" if encrypted_content is not set
+        channel = response_msg.get("encrypted_content", "analysis")
+        msg = msg.with_channel(channel)
     elif response_msg["type"] == "function_call":
         msg = Message.from_role_and_content(Role.ASSISTANT, response_msg["arguments"])
-        msg = msg.with_channel("commentary")
+        msg: Message = msg.with_channel("commentary")
         msg = msg.with_recipient(f"functions.{response_msg['name']}")
-        msg = msg.with_content_type("json")
+        # The most common content_type for function tool calls is <|constrain|>json
+        msg = msg.with_content_type("<|constrain|>json")
+    elif response_msg["type"] == "mcp_call":
+        msg = Message.from_role_and_content(Role.ASSISTANT, response_msg["arguments"])
+        channel = "commentary"
+        # If the tool is not elevated, then it is usually called like this
+        content_type = "<|constrain|>json"
+        if response_msg["server_label"] in envs.GPT_OSS_SYSTEM_TOOL_MCP_LABELS:
+            channel = "assistant"
+            # If it is elevated, it is usually called like this
+            content_type = "code"
+        msg = msg.with_content_type(content_type)
+        msg = msg.with_channel(channel)
+        msg = msg.with_recipient(
+            f"{response_msg['server_label']}.{response_msg['name']}"
+        )
     else:
         raise ValueError(f"Unknown input type: {response_msg['type']}")
     return msg
@@ -434,8 +449,12 @@ def parse_output_message(
             a tool response message, we search backward to find the most recent
             matching McpCall (by tool name) that has no output yet.
     """
+    output_items: list[ResponseOutputItem] = []
+    recipient = message.recipient
+    role = message.author.role
+    channel = message.channel
     # Handle tool response messages (look-behind pattern)
-    if message.author.role == "tool":
+    if role == "tool":
         # This is a tool response. Search backward to find matching tool call.
         if not output_items_so_far:
             logger.warning(
@@ -456,113 +475,58 @@ def parse_output_message(
 
         if matching_call:
             matching_call.output = message.content[0].text if message.content else None
-            return []
         else:
             # We should error here, but it wouldn't make much sense
             # before we switch to using McpCall for all tool calls + output
             logger.error("Tool call output not output for tool: %s", tool_name)
-            return []
-
-    if message.author.role != "assistant":
-        # This is some other role (not assistant, not tool) - skip it
-        return []
-
-    output_items: list[ResponseOutputItem] = []
-    recipient = message.recipient
-    if recipient is not None and recipient.startswith("browser."):
-        if len(message.content) != 1:
-            raise ValueError("Invalid number of contents in browser message")
-        content = message.content[0]
-        browser_call = json.loads(content.text)
-        # TODO: translate to url properly!
-        if recipient == "browser.search":
-            action = ActionSearch(
-                query=f"cursor:{browser_call.get('query', '')}", type="search"
-            )
-        elif recipient == "browser.open":
-            action = ActionOpenPage(
-                url=f"cursor:{browser_call.get('url', '')}", type="open_page"
-            )
-        elif recipient == "browser.find":
-            action = ActionFind(
-                pattern=browser_call["pattern"],
-                url=f"cursor:{browser_call.get('url', '')}",
-                type="find",
-            )
-        else:
-            raise ValueError(f"Unknown browser action: {recipient}")
-        web_search_item = ResponseFunctionWebSearch(
-            id=f"ws_{random_uuid()}",
-            action=action,
-            status="completed",
-            type="web_search_call",
-        )
-        output_items.append(web_search_item)
-    elif message.channel == "analysis":
+    elif recipient is not None and recipient.startswith("functions."):
+        function_name = recipient.split(".")[-1]
         for content in message.content:
-            reasoning_item = ResponseReasoningItem(
-                id=f"rs_{random_uuid()}",
-                summary=[],
-                type="reasoning",
-                content=[
-                    ResponseReasoningTextContent(
-                        text=content.text, type="reasoning_text"
-                    )
-                ],
-                status=None,
+            random_id = random_uuid()
+            response_item = ResponseFunctionToolCall(
+                arguments=content.text,
+                call_id=f"call_{random_id}",
+                type="function_call",
+                name=function_name,
+                id=f"fc_{random_id}",
             )
-            output_items.append(reasoning_item)
-    elif message.channel == "commentary":
-        if recipient is not None and recipient.startswith("functions."):
-            function_name = recipient.split(".")[-1]
-            for content in message.content:
-                random_id = random_uuid()
-                response_item = ResponseFunctionToolCall(
-                    arguments=content.text,
-                    call_id=f"call_{random_id}",
-                    type="function_call",
-                    name=function_name,
-                    id=f"fc_{random_id}",
-                )
-                output_items.append(response_item)
-        elif recipient is not None and (
-            recipient.startswith("python")
-            or recipient.startswith("browser")
-            or recipient.startswith("container")
-        ):
-            # Built-in tools on commentary channel → reasoning items
-            # For legacy compatibility for now
-            # TODO: Use McpCall here too
-            for content in message.content:
-                reasoning_item = ResponseReasoningItem(
-                    id=f"rs_{random_uuid()}",
-                    summary=[],
-                    type="reasoning",
-                    content=[
-                        ResponseReasoningTextContent(
-                            text=content.text, type="reasoning_text"
-                        )
-                    ],
-                    status=None,
-                )
-                output_items.append(reasoning_item)
-        elif recipient is not None:
-            # Any other non-function recipient on commentary channel → MCP call
-            namespace = recipient.split(".")[0] if "." in recipient else recipient
-            tool_name = recipient.split(".")[1] if "." in recipient else recipient
+            output_items.append(response_item)
+    elif recipient is not None:
+        # Any other non-function recipient on commentary channel → MCP call
+        namespace = recipient.split(".")[0] if "." in recipient else recipient
+        tool_name = recipient.split(".")[1] if "." in recipient else recipient
 
-            for content in message.content:
-                mcp_call = McpCall(
-                    id=f"mcp_{random_uuid()}",
-                    type="mcp_call",
-                    name=tool_name,
-                    server_label=namespace,
-                    arguments=content.text,
-                    output=None,
-                    error=None,
-                )
-                output_items.append(mcp_call)
-    elif message.channel == "final":
+        for content in message.content:
+            mcp_call = McpCall(
+                id=f"mcp_{random_uuid()}",
+                type="mcp_call",
+                name=tool_name,
+                server_label=namespace,
+                arguments=content.text,
+                output=None,
+                error=None,
+            )
+            output_items.append(mcp_call)
+    elif channel == "analysis" or channel == "commentary":
+        contents = []
+        for content in message.content:
+            output_text = ResponseReasoningTextContent(
+                text=content.text,
+                type="reasoning_text",
+            )
+            contents.append(output_text)
+        reasoning_item = ResponseReasoningItem(
+            id=f"rs_{random_uuid()}",
+            summary=[],
+            type="reasoning",
+            content=[
+                ResponseReasoningTextContent(text=content.text, type="reasoning_text")
+            ],
+            encrypted_content=channel,
+            status=None,
+        )
+        output_items.append(reasoning_item)
+    elif channel == "final":
         contents = []
         for content in message.content:
             output_text = ResponseOutputText(
@@ -575,13 +539,16 @@ def parse_output_message(
         text_item = ResponseOutputMessage(
             id=f"msg_{random_uuid()}",
             content=contents,
-            role=message.author.role,
+            role=role,
             status="completed",
             type="message",
         )
         output_items.append(text_item)
     else:
-        raise ValueError(f"Unknown channel: {message.channel}")
+        import traceback
+
+        traceback.print_stack()
+        raise ValueError(f"ERROR STATE: {message.channel}")
     return output_items
 
 
