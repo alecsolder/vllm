@@ -89,7 +89,7 @@ from vllm.entrypoints.openai.protocol import (
 )
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
-from vllm.entrypoints.tool_server import ToolServer
+from vllm.entrypoints.tool_server import DynamicToolServer, ToolServer
 from vllm.inputs.data import TokensPrompt as EngineTokensPrompt
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob as SampleLogprob
@@ -288,132 +288,134 @@ class OpenAIServingResponses(OpenAIServing):
         # sees normalized tools with server_label attributes.
         request.tools = [normalize_tool_to_mcp(tool) for tool in request.tools]
 
-        try:
-            lora_request = self._maybe_get_adapters(request)
-            model_name = self.models.model_name(lora_request)
-            tokenizer = await self.engine_client.get_tokenizer()
-
-            if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
-                    self._make_request_with_harmony(request, prev_response)
-                )
-            else:
-                messages, request_prompts, engine_prompts = await self._make_request(
-                    request, prev_response, tokenizer
-                )
-
-        except (
-            ValueError,
-            TypeError,
-            RuntimeError,
-            jinja2.TemplateError,
-            NotImplementedError,
-        ) as e:
-            logger.exception("Error in preprocessing prompt inputs")
-            return self.create_error_response(f"{e} {e.__cause__}")
-
-        request_metadata = RequestResponseMetadata(request_id=request.request_id)
-        if raw_request:
-            raw_request.state.request_metadata = request_metadata
-
-        # Schedule the request and get the result generator.
-        generators: list[AsyncGenerator[ConversationContext, None]] = []
-
-        enabled_tool_namespaces: set[str] = set()
-        if self.use_harmony:
-            # Add all MCP tools from the request (they've been normalized already)
-            for tool in request.tools:
-                if tool.type == "mcp":
-                    enabled_tool_namespaces.add(tool.server_label)
-
-        try:
-            for i, engine_prompt in enumerate(engine_prompts):
-                maybe_error = self._validate_generator_input(engine_prompt)
-                if maybe_error is not None:
-                    return maybe_error
-
-                default_max_tokens = self.max_model_len - len(
-                    engine_prompt["prompt_token_ids"]
-                )
-
-                sampling_params = request.to_sampling_params(
-                    default_max_tokens, self.default_sampling_params
-                )
-
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
-                )
-
-                context: ConversationContext
-                if self.use_harmony:
-                    if request.stream:
-                        context = StreamingHarmonyContext(
-                            messages,
-                            list(enabled_tool_namespaces),
-                        )
-                    else:
-                        context = HarmonyContext(
-                            messages,
-                            list(enabled_tool_namespaces),
-                        )
-                else:
-                    context = SimpleContext()
-                generator = self._generate_with_builtin_tools(
-                    request_id=request.request_id,
-                    request_prompt=request_prompts[i],
-                    engine_prompt=engine_prompt,
-                    sampling_params=sampling_params,
-                    context=context,
-                    lora_request=lora_request,
-                    priority=request.priority,
-                    trace_headers=trace_headers,
-                )
-                generators.append(generator)
-        except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
-
-        assert len(generators) == 1
-        (result_generator,) = generators
-
-        # Store the input messages.
-        if request.store:
-            self.msg_store[request.request_id] = messages
-
-        if request.background:
-            created_time = int(time.time())
-            response = ResponsesResponse.from_request(
-                request,
-                sampling_params,
-                model_name=model_name,
-                created_time=created_time,
-                output=[],
-                status="queued",
-                usage=None,
+        # Create request-scoped tool server with dynamic MCP support
+        # Use async context manager for automatic cleanup
+        async with DynamicToolServer(
+            static_tool_server=self.tool_server
+        ) as tool_server:
+            # Register dynamic MCP tools (those with server_url set)
+            error_response = await self._register_dynamic_tools(
+                request.tools, tool_server
             )
-            async with self.response_store_lock:
-                self.response_store[response.id] = response
+            if error_response is not None:
+                return error_response
 
-            # Run the request in the background.
-            if request.stream:
-                task = asyncio.create_task(
-                    self._run_background_request_stream(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                        created_time,
-                    ),
-                    name=f"create_{request.request_id}",
+            try:
+                lora_request = self._maybe_get_adapters(request)
+                model_name = self.models.model_name(lora_request)
+                tokenizer = await self.engine_client.get_tokenizer()
+
+                if self.use_harmony:
+                    messages, request_prompts, engine_prompts = (
+                        self._make_request_with_harmony(
+                            request, prev_response, tool_server=tool_server
+                        )
+                    )
+                else:
+                    (
+                        messages,
+                        request_prompts,
+                        engine_prompts,
+                    ) = await self._make_request(request, prev_response, tokenizer)
+
+            except (
+                ValueError,
+                TypeError,
+                RuntimeError,
+                jinja2.TemplateError,
+                NotImplementedError,
+            ) as e:
+                logger.exception("Error in preprocessing prompt inputs")
+                return self.create_error_response(f"{e} {e.__cause__}")
+
+            request_metadata = RequestResponseMetadata(request_id=request.request_id)
+            if raw_request:
+                raw_request.state.request_metadata = request_metadata
+
+            # Schedule the request and get the result generator.
+            generators: list[AsyncGenerator[ConversationContext, None]] = []
+
+            enabled_tool_namespaces: set[str] = set()
+            if self.use_harmony:
+                # Add all MCP tools from the request (they've been normalized already)
+                for tool in request.tools:
+                    if tool.type == "mcp":
+                        enabled_tool_namespaces.add(tool.server_label)
+
+            try:
+                for i, engine_prompt in enumerate(engine_prompts):
+                    maybe_error = self._validate_generator_input(engine_prompt)
+                    if maybe_error is not None:
+                        return maybe_error
+
+                    default_max_tokens = self.max_model_len - len(
+                        engine_prompt["prompt_token_ids"]
+                    )
+
+                    sampling_params = request.to_sampling_params(
+                        default_max_tokens, self.default_sampling_params
+                    )
+
+                    trace_headers = (
+                        None
+                        if raw_request is None
+                        else await self._get_trace_headers(raw_request.headers)
+                    )
+
+                    context: ConversationContext
+                    if self.use_harmony:
+                        if request.stream:
+                            context = StreamingHarmonyContext(
+                                messages,
+                                list(enabled_tool_namespaces),
+                            )
+                        else:
+                            context = HarmonyContext(
+                                messages,
+                                list(enabled_tool_namespaces),
+                            )
+                    else:
+                        context = SimpleContext()
+                    generator = self._generate_with_builtin_tools(
+                        request_id=request.request_id,
+                        request_prompt=request_prompts[i],
+                        engine_prompt=engine_prompt,
+                        sampling_params=sampling_params,
+                        context=context,
+                        lora_request=lora_request,
+                        priority=request.priority,
+                        trace_headers=trace_headers,
+                    )
+                    generators.append(generator)
+            except ValueError as e:
+                # TODO: Use a vllm-specific Validation Error
+                return self.create_error_response(str(e))
+
+            assert len(generators) == 1
+            (result_generator,) = generators
+
+            # Store the input messages.
+            if request.store:
+                self.msg_store[request.request_id] = messages
+
+            if request.background:
+                created_time = int(time.time())
+                response = ResponsesResponse.from_request(
+                    request,
+                    sampling_params,
+                    model_name=model_name,
+                    created_time=created_time,
+                    output=[],
+                    status="queued",
+                    usage=None,
                 )
-            else:
+                async with self.response_store_lock:
+                    self.response_store[response.id] = response
+
+                # Run the request in the background with its own tool_server lifecycle
+                # Capture current tool_server and request for background task closure
                 task = asyncio.create_task(
-                    self._run_background_request(
+                    self._run_background_with_dynamic_tools(
                         request,
                         sampling_params,
                         result_generator,
@@ -422,44 +424,88 @@ class OpenAIServingResponses(OpenAIServing):
                         tokenizer,
                         request_metadata,
                         created_time,
+                        request.tools,  # Pass tools for re-registration
                     ),
                     name=f"create_{response.id}",
                 )
 
-            # For cleanup.
-            response_id = response.id
-            self.background_tasks[response_id] = task
-            task.add_done_callback(
-                lambda _: self.background_tasks.pop(response_id, None)
-            )
+                # Track and cleanup
+                response_id = response.id
+                self.background_tasks[response_id] = task
+                task.add_done_callback(
+                    lambda _: self.background_tasks.pop(response_id, None)
+                )
+
+                if request.stream:
+                    return self.responses_background_stream_generator(
+                        request.request_id
+                    )
+                return response
 
             if request.stream:
-                return self.responses_background_stream_generator(request.request_id)
-            return response
+                return self.responses_stream_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    tool_server=tool_server,
+                )
 
-        if request.stream:
-            return self.responses_stream_generator(
-                request,
-                sampling_params,
-                result_generator,
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
-            )
+            try:
+                return await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    tool_server=tool_server,
+                )
+            except Exception as e:
+                return self.create_error_response(str(e))
 
-        try:
-            return await self.responses_full_generator(
-                request,
-                sampling_params,
-                result_generator,
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
-            )
-        except Exception as e:
-            return self.create_error_response(str(e))
+    async def _register_dynamic_tools(
+        self,
+        tools: list,
+        tool_server: DynamicToolServer,
+    ) -> ErrorResponse | None:
+        """Register dynamic MCP tools (those with server_url set).
+
+        Args:
+            tools: List of tools (already normalized to MCP format)
+            tool_server: DynamicToolServer instance to register tools with
+
+        Returns:
+            ErrorResponse if registration fails, None otherwise
+        """
+        from openai.types.responses.tool import Mcp
+
+        dynamic_mcp_tools = [
+            tool
+            for tool in tools
+            if isinstance(tool, Mcp) and tool.server_url is not None
+        ]
+
+        for tool in dynamic_mcp_tools:
+            try:
+                await tool_server.register_dynamic_mcp_server(
+                    server_label=tool.server_label, server_url=tool.server_url
+                )
+            except (ValueError, ConnectionError) as e:
+                return self.create_error_response(
+                    err_type="invalid_request_error",
+                    message=(
+                        f"Failed to register dynamic MCP server "
+                        f"'{tool.server_label}': {e}"
+                    ),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+        return None
 
     async def _make_request(
         self,
@@ -486,12 +532,15 @@ class OpenAIServingResponses(OpenAIServing):
         self,
         request: ResponsesRequest,
         prev_response: ResponsesResponse | None,
+        tool_server: ToolServer | None = None,
     ):
         if request.tool_choice != "auto":
             raise NotImplementedError(
                 "Only 'auto' tool_choice is supported in response API with Harmony"
             )
-        messages = self._construct_input_messages_with_harmony(request, prev_response)
+        messages = self._construct_input_messages_with_harmony(
+            request, prev_response, tool_server=tool_server
+        )
         prompt_token_ids = render_for_completion(messages)
         engine_prompt = EngineTokensPrompt(prompt_token_ids=prompt_token_ids)
 
@@ -506,16 +555,21 @@ class OpenAIServingResponses(OpenAIServing):
         request: ResponsesRequest,
         context: ConversationContext,
         exit_stack: AsyncExitStack,
+        tool_server: ToolServer | None = None,
     ):
         # we should only initialize the tool session if the request needs tools
         if len(request.tools) == 0:
             return
 
+        # Use provided tool_server (may contain dynamic registrations)
+        # or fall back to self.tool_server
+        effective_tool_server = tool_server or self.tool_server
+
         mcp_tools = {
             tool.server_label: tool for tool in request.tools if tool.type == "mcp"
         }
         await context.init_tool_sessions(
-            self.tool_server, exit_stack, request.request_id, mcp_tools
+            effective_tool_server, exit_stack, request.request_id, mcp_tools
         )
 
     async def responses_full_generator(
@@ -528,13 +582,16 @@ class OpenAIServingResponses(OpenAIServing):
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        tool_server: ToolServer | None = None,
     ) -> ErrorResponse | ResponsesResponse:
         if created_time is None:
             created_time = int(time.time())
 
         async with AsyncExitStack() as exit_stack:
             try:
-                await self._initialize_tool_sessions(request, context, exit_stack)
+                await self._initialize_tool_sessions(
+                    request, context, exit_stack, tool_server=tool_server
+                )
                 async for _ in result_generator:
                     pass
             except asyncio.CancelledError:
@@ -556,6 +613,8 @@ class OpenAIServingResponses(OpenAIServing):
             if request.enable_response_messages:
                 input_messages = context.messages[: context.num_init_messages]
                 output_messages = context.messages[context.num_init_messages :]
+                print(input_messages)
+                print(output_messages)
             num_tool_output_tokens = context.num_tool_output_tokens
             if len(output) > 0:
                 if context.finish_reason == "length":
@@ -846,6 +905,7 @@ class OpenAIServingResponses(OpenAIServing):
         self,
         request: ResponsesRequest,
         prev_response: ResponsesResponse | None,
+        tool_server: ToolServer | None = None,
     ) -> list[OpenAIHarmonyMessage]:
         messages: list[OpenAIHarmonyMessage] = []
         if prev_response is None:
@@ -855,7 +915,7 @@ class OpenAIServingResponses(OpenAIServing):
             # Use unified helper to build messages
             sys_dev_messages = build_system_and_developer_messages(
                 request_tools=request.tools,
-                tool_server=self.tool_server,
+                tool_server=tool_server or self.tool_server,
                 instructions=request.instructions,
                 reasoning_effort=reasoning_effort,
             )
@@ -919,6 +979,60 @@ class OpenAIServingResponses(OpenAIServing):
                 if isinstance(response_msg, ResponseFunctionToolCall):
                     prev_outputs.append(response_msg)
         return messages
+
+    async def _run_background_with_dynamic_tools(
+        self,
+        request: ResponsesRequest,
+        sampling_params: SamplingParams,
+        result_generator: AsyncIterator[ConversationContext],
+        context: ConversationContext,
+        model_name: str,
+        tokenizer: AnyTokenizer,
+        request_metadata: RequestResponseMetadata,
+        created_time: int,
+        tools: list,
+    ):
+        """Run background request with its own DynamicToolServer lifecycle.
+
+        This wrapper ensures dynamic MCP tools are re-registered for the
+        background task and properly cleaned up when the task completes.
+        """
+        async with DynamicToolServer(
+            static_tool_server=self.tool_server
+        ) as bg_tool_server:
+            # Re-register dynamic tools for this background task
+            error_response = await self._register_dynamic_tools(tools, bg_tool_server)
+            if error_response is not None:
+                # Store error in response store
+                async with self.response_store_lock:
+                    self.response_store[request.request_id] = error_response
+                return
+
+            if request.stream:
+                await self._run_background_request_stream(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time,
+                    tool_server=bg_tool_server,
+                )
+            else:
+                await self._run_background_request(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time,
+                    tool_server=bg_tool_server,
+                )
+            # Automatic cleanup when exiting context manager
 
     async def _run_background_request_stream(
         self,
@@ -1766,6 +1880,7 @@ class OpenAIServingResponses(OpenAIServing):
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        tool_server: ToolServer | None = None,
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
         # TODO:
         # 1. Handle disconnect
@@ -1789,7 +1904,9 @@ class OpenAIServingResponses(OpenAIServing):
             if self.use_harmony:
                 # TODO: in streaming, we noticed this bug:
                 # https://github.com/vllm-project/vllm/issues/25697
-                await self._initialize_tool_sessions(request, context, exit_stack)
+                await self._initialize_tool_sessions(
+                    request, context, exit_stack, tool_server=tool_server
+                )
                 processer = self._process_harmony_streaming_events
             else:
                 processer = self._process_simple_streaming_events
@@ -1846,6 +1963,7 @@ class OpenAIServingResponses(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 created_time=created_time,
+                tool_server=tool_server,
             )
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(

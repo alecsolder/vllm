@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for dynamic MCP tools (elevated) using server_url."""
 
 import subprocess
 
 import pytest
 import pytest_asyncio
 
-from ...utils import RemoteOpenAIServer, find_free_port
+from tests.utils import RemoteOpenAIServer, find_free_port
+
+from ..responses_utils import verify_tool_on_channel
 from .memory_mcp_server import start_test_server
-from .responses_utils import verify_tool_on_channel
 
 MODEL_NAME = "openai/gpt-oss-20b"
 
@@ -43,14 +45,12 @@ def memory_mcp_server():
 
 
 @pytest.fixture(scope="module")
-def memory_elevated_server(monkeypatch_module, memory_mcp_server):
-    """vLLM server with Memory MCP tool elevated."""
-    server_url, port = memory_mcp_server
-    args = ["--enforce-eager", "--tool-server", f"localhost:{port}"]
+def server_for_dynamic_elevated(monkeypatch_module):
+    """vLLM server WITHOUT static --tool-server but WITH elevation config."""
+    args = ["--enforce-eager"]  # No --tool-server!
 
     with monkeypatch_module.context() as m:
         m.setenv("VLLM_ENABLE_RESPONSES_API_STORE", "1")
-        # Use system instructions to ensure model follows directions
         m.setenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "1")
         m.setenv("GPT_OSS_SYSTEM_TOOL_MCP_LABELS", "memory")  # Elevate memory tool
         with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
@@ -58,22 +58,27 @@ def memory_elevated_server(monkeypatch_module, memory_mcp_server):
 
 
 @pytest_asyncio.fixture
-async def memory_elevated_client(memory_elevated_server):
-    async with memory_elevated_server.get_async_client() as async_client:
+async def client_for_dynamic_elevated(server_for_dynamic_elevated):
+    async with server_for_dynamic_elevated.get_async_client() as async_client:
         yield async_client
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
-async def test_memory_mcp_elevated(memory_elevated_client, model_name: str):
-    """Test Memory MCP tool as elevated.
+async def test_memory_mcp_dynamic_elevated(
+    client_for_dynamic_elevated, memory_mcp_server, model_name: str
+):
+    """Test Memory MCP tool with dynamic per-request registration (elevated).
 
-    When memory IS in GPT_OSS_SYSTEM_TOOL_MCP_LABELS:
-    - Tool should be in system message (not developer message)
-    - Tool calls should be on analysis channel
-    - Tool responses should be on analysis channel
+    This tests the dynamic MCP server registration flow where:
+    1. No static --tool-server is configured
+    2. Tool server is registered dynamically via server_url in the request
+    3. Tool IS in GPT_OSS_SYSTEM_TOOL_MCP_LABELS (elevated)
+    4. Tool calls/responses should be on analysis channel
     """
-    response = await memory_elevated_client.responses.create(
+    server_url, port = memory_mcp_server
+
+    response = await client_for_dynamic_elevated.responses.create(
         model=model_name,
         instructions=(
             "You must use the memory.store and memory.retrieve tools. "
@@ -81,15 +86,15 @@ async def test_memory_mcp_elevated(memory_elevated_client, model_name: str):
             "on the analysis channel like a normal system tool."
         ),
         input=(
-            "Store the key 'elevated_key' with value 'elevated_value' and retrieve it"
+            "Store the key 'dynamic_elevated_key' with value "
+            "'dynamic_elevated_value' and retrieve it"
         ),
         tools=[
             {
                 "type": "mcp",
                 "server_label": "memory",
-                # URL unused, connection via --tool-server
-                "server_url": "http://unused",
-                "headers": {"x-memory-id": "test-session-elevated"},
+                "server_url": server_url,  # Dynamic registration via server_url!
+                "headers": {"x-memory-id": "test-session-dynamic-elevated"},
             }
         ],
         extra_body={"enable_response_messages": True},
@@ -100,7 +105,6 @@ async def test_memory_mcp_elevated(memory_elevated_client, model_name: str):
     assert response.usage.output_tokens_details.tool_output_tokens > 0
 
     # Verify input messages: Should have system message with tool, NO developer message
-    # (since all tools are elevated)
     developer_messages = [
         msg for msg in response.input_messages if msg["author"]["role"] == "developer"
     ]
@@ -119,5 +123,6 @@ async def test_memory_mcp_elevated(memory_elevated_client, model_name: str):
                 if hasattr(content_item, "text"):
                     output_text += content_item.text
     assert (
-        "elevated_value" in output_text.lower() or "successfully" in output_text.lower()
+        "dynamic_elevated_value" in output_text.lower()
+        or "successfully" in output_text.lower()
     )

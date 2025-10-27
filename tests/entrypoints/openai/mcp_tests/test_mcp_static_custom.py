@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for static MCP tools (custom/non-elevated) using --tool-server."""
 
 import json
 import subprocess
@@ -7,8 +8,10 @@ import subprocess
 import pytest
 import pytest_asyncio
 
-from ...utils import RemoteOpenAIServer
-from .responses_utils import build_conversation_from_response, verify_tool_on_channel
+from tests.utils import RemoteOpenAIServer, find_free_port
+
+from ..responses_utils import build_conversation_from_response, verify_tool_on_channel
+from .memory_mcp_server import start_test_server
 
 MODEL_NAME = "openai/gpt-oss-20b"
 
@@ -25,10 +28,6 @@ def monkeypatch_module():
 @pytest.fixture(scope="module")
 def memory_mcp_server():
     """Start Memory MCP server as subprocess."""
-    from tests.utils import find_free_port
-
-    from .memory_mcp_server import start_test_server
-
     # Find a free port
     port = find_free_port()
 
@@ -48,7 +47,7 @@ def memory_mcp_server():
 
 @pytest.fixture(scope="module")
 def memory_custom_server(monkeypatch_module, memory_mcp_server):
-    """vLLM server with Memory MCP tool as custom (not elevated)."""
+    """vLLM server with Memory MCP tool as custom (not elevated) via --tool-server."""
     server_url, port = memory_mcp_server
     args = ["--enforce-eager", "--tool-server", f"localhost:{port}"]
 
