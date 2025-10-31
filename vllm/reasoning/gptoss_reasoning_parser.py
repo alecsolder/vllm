@@ -1,71 +1,120 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import json
+import os
 from collections.abc import Sequence
 
 from transformers import PreTrainedTokenizerBase
 
 from vllm.entrypoints.harmony_utils import parse_chat_output
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest, DeltaMessage
-from vllm.entrypoints.tool_server import ToolServer
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 
 logger = init_logger(__name__)
 
-no_func_reaonsing_tag = {
+TRIGGERS = ["<|channel|>", "<|start|>assistant"]
+BASE_TAGS = [
+    # Allow normal reasoning messages as the first message
+    {
+        "type": "tag",
+        "begin": "<|channel|>analysis",
+        "content": {"type": "regex", "pattern": "(?:)"},
+        "end": "<|message|>",
+    },
+    {
+        "type": "tag",
+        "begin": "<|channel|>commentary",
+        "content": {"type": "regex", "pattern": "(?:)"},
+        "end": "<|message|>",
+    },
+    # Allow final messages as the first message
+    {
+        "type": "tag",
+        "begin": "<|channel|>final",
+        "content": {"type": "regex", "pattern": "(?:)"},
+        "end": "<|message|>",
+    },
+    # Allow final messages as the last message
+    {
+        "type": "tag",
+        "begin": "<|start|>assistant<|channel|>final",
+        "content": {"type": "regex", "pattern": "(?:)"},
+        "end": "<|message|>",
+    },
+]
+
+
+STRUCTURAL_TAG_TEMPLATE = {
     "type": "structural_tag",
     "format": {
         "type": "triggered_tags",
-        "tags": [
-            {
-                "begin": "<|channel|>analysis<|message|>",
-                "content": {"type": "any_text"},
-                "end": "<|end|>",
-            }
-        ],
-        "triggers": ["<|channel|>analysis"],
+        "triggers": ["<|channel|>", "<|start|>assistant"],
+        "tags": [],
+        "at_least_one": True,
         "stop_after_first": False,
     },
 }
 
 
-def from_builtin_tool_to_tag(tool: str) -> list[dict]:
-    tag = [
+def create_tool_tags(channel_name: str, tool_name: str) -> list[dict]:
+    """
+    Generate tool-specific tags based on channel name and tool name.
+
+    Args:
+        channel_name: The channel name (e.g., "analysis", "commentary")
+        tool_name: The tool name (e.g., "python", "container")
+
+    Returns:
+        List of two tag dictionaries for first and last message positions
+    """
+    analysis_content_type = "code"
+    commentary_content_type = "<|constrain|>json"
+    content_type = (
+        analysis_content_type if channel_name == "analysis" else commentary_content_type
+    )
+    return [
+        # Tool as first message
         {
-            "begin": f"<|channel|>commentary to={tool}",
-            "content": {"type": "any_text"},
-            "end": "<|end|>",
+            "type": "tag",
+            "begin": f"<|channel|>{channel_name} to={tool_name}",
+            "content": {"type": "regex", "pattern": "(?:)"},
+            "end": f" {content_type}<|message|>",
         },
+        # Tool as last message
         {
-            "begin": f"<|channel|>analysis to={tool}",
-            "content": {"type": "any_text"},
-            "end": "<|end|>",
+            "type": "tag",
+            "begin": f"<|start|>assistant<|channel|>{channel_name} to={tool_name}",
+            "content": {"type": "regex", "pattern": "(?:)"},
+            "end": f" {content_type}<|message|>",
         },
     ]
-    return tag
 
 
-def tag_with_builtin_funcs(no_func_reaonsing_tag, builtin_tool_list: list[str]) -> dict:
-    import copy
+def get_structural_tags(analysis_tools: set[str], commentary_tools: set[str]):
+    # Start with base tags
+    tags = BASE_TAGS.copy()
 
-    new_tag = copy.deepcopy(no_func_reaonsing_tag)
-    new_tag["format"]["triggers"].append("<|channel|>commentary to=")
+    # Add tool-specific tags for commentary channel
+    for tool_name in commentary_tools:
+        if tool_name:  # Skip empty strings from split
+            tags.extend(create_tool_tags("commentary", tool_name))
 
-    for tool in builtin_tool_list:
-        new_tag["format"]["tags"].extend(from_builtin_tool_to_tag(tool))
-    return new_tag
+    # Add tool-specific tags for analysis channel
+    for tool_name in analysis_tools:
+        if tool_name:  # Skip empty strings from split
+            tags.extend(create_tool_tags("analysis", tool_name))
+
+    # Build the complete structural tag
+    structural_tags = copy.deepcopy(STRUCTURAL_TAG_TEMPLATE)
+    structural_tags["format"]["tags"] = tags
+    print(structural_tags)
+    return json.dumps(structural_tags)
 
 
 @ReasoningParserManager.register_module("openai_gptoss")
 class GptOssReasoningParser(ReasoningParser):
-    """
-    Reasoning parser for GptOss model.
-
-    The GptOss model uses harmony to extract reasoning content and this parser
-    is only used for detecting the end of the reasoning content.
-    """
-
     def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
         self.reasoning_end_token_ids = self.model_tokenizer.encode(
@@ -128,30 +177,10 @@ class GptOssReasoningParser(ReasoningParser):
 
     # This function prepares the structural tag to format reasoning output
     def prepare_structured_tag(
-        self, original_tag: str | None, tool_server: ToolServer | None
+        self, original_tag: str | None, analysis_tools, commentary_tools
     ) -> str:
         if original_tag is None:
-            if tool_server is None:
-                return json.dumps(no_func_reaonsing_tag)
-            else:
-                builtin_tool_list: list[str] = []
-                if tool_server.has_tool("browser"):
-                    builtin_tool_list.append("browser")
-                if tool_server.has_tool("python"):
-                    builtin_tool_list.append("python")
-                if tool_server.has_tool("container"):
-                    builtin_tool_list.append("container")
-
-                if len(builtin_tool_list) > 0:
-                    logger.info("Builtin_tool_list: %s", builtin_tool_list)
-                    func_tag = json.dumps(
-                        tag_with_builtin_funcs(no_func_reaonsing_tag, builtin_tool_list)
-                    )
-                else:
-                    logger.info("Builtin_tool_list is empty")
-                    func_tag = json.dumps(no_func_reaonsing_tag)
-
-                return func_tag
+            return get_structural_tags(analysis_tools, commentary_tools)
         else:
             # There is potential risk for appending the tag to the original tag
             return original_tag
