@@ -376,6 +376,21 @@ class OpenAIServingResponses(OpenAIServing):
                     context = SimpleContext()
 
                 if self.reasoning_parser is not None:
+                    tool_types = extract_tool_types(request.tools)
+                    analysis_tools = set()
+                    if "container" in tool_types:
+                        analysis_tools.update(["container.exec"])
+                    if "web_search_preview" in tool_types:
+                        analysis_tools.update(
+                            ["browser.search", "browser.find", "browser.open"]
+                        )
+                    if "code_interpreter" in tool_types:
+                        analysis_tools.update(["python"])
+
+                    commentary_tools = set()
+                    for tool in request.tools:
+                        if tool.type == "function":
+                            commentary_tools.add(f"functions.{tool.name}")
                     reasoning_parser = self.reasoning_parser(tokenizer)
                     if sampling_params.structured_outputs is None:
                         sampling_params.structured_outputs = StructuredOutputsParams()
@@ -384,7 +399,8 @@ class OpenAIServingResponses(OpenAIServing):
                         sampling_params.structured_outputs.structural_tag = (
                             reasoning_parser.prepare_structured_tag(
                                 sampling_params.structured_outputs.structural_tag,
-                                self.tool_server,
+                                analysis_tools,
+                                commentary_tools,
                             )
                         )
                 generator = self._generate_with_builtin_tools(
@@ -589,6 +605,8 @@ class OpenAIServingResponses(OpenAIServing):
             if request.enable_response_messages:
                 input_messages = context.messages[: context.num_init_messages]
                 output_messages = context.messages[context.num_init_messages :]
+                print(input_messages)
+                print(output_messages)
             num_tool_output_tokens = context.num_tool_output_tokens
             if len(output) > 0:
                 if context.finish_reason == "length":
