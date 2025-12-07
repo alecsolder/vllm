@@ -306,60 +306,51 @@ class StructuredOutputManager:
         # and deserialization when sending this to the GPU workers.
         return bitmask_tensor.numpy()
 
-    def submit_async_bitmask_task(
+    def advance_and_compute_bitmask_async(
         self,
         requests: dict[str, Request],
+        sampled_token_ids: "torch.Tensor",
+        req_ids: list[str],
         structured_output_request_ids: list[str],
         scheduled_spec_decode_tokens: dict[str, list[int]],
-        previous_sampled_tokens_future: Future,
     ) -> None:
         """
-        Submit a background task to:
-        1. Wait for previous step's tokens (Token N).  
-        2. Advance FSMs specifically for this step.
-        3. Compute the bitmask.
+        Kick off background task to:
+        1. Advance FSMs with the sampled tokens.
+        2. Compute the bitmask for the NEXT step.
+        
+        This should be called from sample_tokens(N) after bookkeeping,
+        and the result will be consumed in sample_tokens(N+1).
         """
         self.bitmask_future = self.async_bitmask_executor.submit(
             self._async_bitmask_worker,
             requests,
+            sampled_token_ids,
+            req_ids,
             structured_output_request_ids,
             scheduled_spec_decode_tokens,
-            previous_sampled_tokens_future,
         )
 
     def _async_bitmask_worker(
         self,
         requests: dict[str, Request],
+        sampled_token_ids: "torch.Tensor",
+        req_ids: list[str],
         structured_output_request_ids: list[str],
         scheduled_spec_decode_tokens: dict[str, list[int]],
-        previous_sampled_tokens_future: Future,
     ) -> "npt.NDArray[np.int32] | None":
-        # 1. Wait for Token N
-        # This future comes from the GPUModelRunner/Runtime
-        sampled_tokens = previous_sampled_tokens_future.result()
-
-        # 2. Advance FSMs if needed
-        # Note: This runs PARALLEL to the Scheduler of Step N+1, but AFTER Step N execution.
-        # We need to be careful not to double-advance.
-        # However, in Async Scheduling, the Scheduler has NOT run `update_from_output` yet.
-        # So we are the ones advancing the state.
-        # We only strictly need to advance the internal state of the grammar *backend*
-        # so that `fill_bitmask` sees the correct state.
-        if sampled_tokens is not None:
-            for req_id, token_id in sampled_tokens.items():
+        # 1. Advance FSMs with sampled tokens
+        if sampled_token_ids is not None:
+            tokens_cpu = sampled_token_ids.cpu().numpy()
+            for req_id, token_id in zip(req_ids, tokens_cpu):
                 if req_id in requests:
                     request = requests[req_id]
                     if self.should_advance(request):
-                        # Use internal backend method to advance without triggering full Scheduler side-effects?
-                        # Or just advance standard via grammar.
-                        # The Scheduler will later see `num_computed_tokens` increase and might try to advance again?
-                        # Actually, `request.spec_token_ids` handling in Scheduler is what usually triggers validation.
-                        # For simple decoding, we just need the grammar to accept the token.
                         request.structured_output_request.grammar.accept_tokens(
-                            req_id, [token_id]
+                            req_id, [int(token_id)]
                         )
         
-        # 3. Compute Bitmask
+        # 2. Compute Bitmask for NEXT step
         return self.grammar_bitmask(
             requests, structured_output_request_ids, scheduled_spec_decode_tokens
         )

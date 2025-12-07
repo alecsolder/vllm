@@ -368,8 +368,6 @@ class GPUModelRunner(
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
-        self.last_sampled_tokens_future: Future | None = Future()
-        self.last_sampled_tokens_future.set_result(None)
 
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
@@ -2971,45 +2969,6 @@ class GPUModelRunner(
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                 )
 
-                # ---------------------------------------------------------------------
-                # Async Scheduling / Structured Output Hook
-                # ---------------------------------------------------------------------
-                # If the Scheduler skipped bitmask generation (Async Mode), we must trigger
-                # the background task here. This overlaps FSM computation with the Forward Pass.
-                if (
-                    self.vllm_config.scheduler_config.async_scheduling
-                    and self.last_sampled_tokens_future is not None
-                ):
-                    # Identify requests needing bitmasks (logic mirrored from Scheduler)
-                    start_idx = 0
-                    structured_req_ids = []
-
-                    # num_scheduled_tokens is a dict {req_id: count}, or we scan input_batch?
-                    # scheduler_output.num_scheduled_tokens is a dict {req_id: count}
-                    # The order in scheduler_output.num_scheduled_tokens determines the bitmask row order.
-
-                    # Optimally, we only scan if we know there are structured requests.
-                    # But we don't have a cheap flag?
-                    # valid_reqs = [r for r in scheduler_output.num_scheduled_tokens if self.requests[r].use_structured_output]
-
-                    # Reconstruct the list expected by StructuredOutputManager
-                    # Note: The bitmask row order MUST match what the Scheduler would have produced
-                    # (or what sample_tokens expects).
-                    # The Scheduler usually builds `structured_output_request_ids` by filtering `scheduler_output.num_scheduled_tokens`.
-
-                    for req_id in scheduler_output.num_scheduled_tokens:
-                        if req := self.requests.get(req_id):
-                            if req.use_structured_output:
-                                structured_req_ids.append(req_id)
-
-                    if structured_req_ids:
-                        self.structured_output_manager.submit_async_bitmask_task(
-                            self.requests,
-                            structured_req_ids,
-                            scheduler_output.scheduled_spec_decode_tokens,
-                            self.last_sampled_tokens_future,
-                        )
-
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
                     "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -3307,27 +3266,28 @@ class GPUModelRunner(
             )
 
         # -------------------------------------------------------------------------
-        # Async Scheduling / Structured Output Hook (Resolution)
+        # Async Scheduling / Structured Output Hook
         # -------------------------------------------------------------------------
-        if self.last_sampled_tokens_future is not None:
-            # Create a new future for the NEXT step
-            next_future = Future()
-
-            # Resolve the CURRENT future with this step's sampled tokens
-            # The FSM running for NEXT step needs {req_id: token_id}
-            if valid_sampled_token_ids is not None:
-                # Ensure CPU
-                tokens_cpu = valid_sampled_token_ids.cpu().numpy()
-                req_ids = self.input_batch.req_ids
-                token_map = {
-                    req_id: int(token_id)
-                    for req_id, token_id in zip(req_ids, tokens_cpu)
-                }
-                self.last_sampled_tokens_future.set_result(token_map)
-            else:
-                self.last_sampled_tokens_future.set_result(None)
-
-            self.last_sampled_tokens_future = next_future
+        # Kick off bitmask computation for NEXT step immediately after we have tokens
+        if (
+            self.vllm_config.scheduler_config.async_scheduling
+            and valid_sampled_token_ids is not None
+        ):
+            # Identify requests needing bitmasks for the NEXT step
+            structured_req_ids = [
+                req_id
+                for req_id in self.input_batch.req_ids
+                if (req := self.requests.get(req_id)) and req.use_structured_output
+            ]
+            
+            if structured_req_ids:
+                self.structured_output_manager.advance_and_compute_bitmask_async(
+                    self.requests,
+                    valid_sampled_token_ids,
+                    self.input_batch.req_ids,
+                    structured_req_ids,
+                    scheduler_output.scheduled_spec_decode_tokens,
+                )
 
         if (
             self.speculative_config
