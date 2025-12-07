@@ -56,7 +56,7 @@ def apply_grammar_bitmask(
 
     Args:
         scheduler_output (SchedulerOutput): The result of engine scheduling.
-        input_batch (InputBatch): The input of model runner.
+        input_batch_req_id_to_index: dict[str, int],
         logits (torch.Tensor): The output logits of model forward.
     """
     # Serialization of np.ndarray is much more efficient than a tensor,

@@ -1019,6 +1019,12 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
+        # For async scheduling, we skip the bitmask generation here.
+        # It will be handled asynchronously on the worker side (or locally on
+        # a separate thread in external_launcher) to overlap with execution.
+        if self.scheduler_config.async_scheduling:
+            return GrammarOutput(structured_output_request_ids, None)
+
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
