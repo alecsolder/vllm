@@ -37,6 +37,9 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.metrics.stats import MultiModalCacheStats
+from vllm.v1.structured_output.backend_cached_guidance import (
+    validate_cached_guidance_grammar,
+)
 from vllm.v1.structured_output.backend_guidance import (
     has_guidance_unsupported_json_features,
     validate_guidance_grammar,
@@ -362,6 +365,15 @@ class InputProcessor:
                     "backends or tokenizer_mode='hf' instead."
                 )
             validate_guidance_grammar(params, tokenizer=None)
+        elif backend == "cached_guidance":
+            # cached_guidance backend (like guidance but with LRU caching)
+            if isinstance(self.tokenizer, MistralTokenizer):
+                raise ValueError(
+                    "Mistral tokenizer is not supported for the 'cached_guidance' "
+                    "structured output backend. Please use ['xgrammar', 'outlines'] "
+                    "backends or tokenizer_mode='hf' instead."
+                )
+            validate_cached_guidance_grammar(params)
         elif backend == "outlines":
             # outlines backend
             validate_structured_output_request_outlines(params)

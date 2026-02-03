@@ -11,7 +11,7 @@ from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
 StructuredOutputsBackend = Literal[
-    "auto", "xgrammar", "guidance", "outlines", "lm-format-enforcer"
+    "auto", "xgrammar", "guidance", "cached_guidance", "outlines", "lm-format-enforcer"
 ]
 
 
