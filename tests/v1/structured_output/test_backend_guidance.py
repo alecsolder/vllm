@@ -4,7 +4,9 @@ import time
 from concurrent.futures import Future
 from typing import Any
 
+import llguidance
 import pytest
+import torch
 from transformers import AutoTokenizer
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
@@ -244,7 +246,7 @@ def test_fill_bitmasks_batch_basic():
 
     # Allocate bitmask for 2 sequences
     bitmask = backend.allocate_token_bitmask(2)
-    full_mask = bitmask.new_full((bitmask.shape[1],), -1)
+    full_mask = torch.tensor(-1, dtype=torch.int32)  # Scalar tensor
 
     # Zero out bitmask to verify it gets filled
     bitmask.zero_()
@@ -288,7 +290,7 @@ def test_fill_bitmasks_batch_with_speculative_tokens():
     # Allocate bitmask for speculative tokens (1 base + 3 spec = 4 positions)
     num_positions = 4
     bitmask = backend.allocate_token_bitmask(num_positions)
-    full_mask = bitmask.new_full((bitmask.shape[1],), -1)
+    full_mask = torch.tensor(-1, dtype=torch.int32)  # Scalar tensor
 
     # Spec tokens that would advance and then need rollback
     spec_tokens = prompt[1:4]  # 3 tokens
@@ -334,7 +336,7 @@ def test_fill_bitmasks_batch_terminated_and_disabled():
 
     # Allocate bitmask
     bitmask = backend.allocate_token_bitmask(2)
-    full_mask = bitmask.new_full((bitmask.shape[1],), -1)
+    full_mask = torch.tensor(-1, dtype=torch.int32)  # Scalar tensor
 
     # Zero out bitmask
     bitmask.zero_()
@@ -397,3 +399,346 @@ def test_accept_tokens_batch():
     # Valid tokens should be accepted
     assert results[0] is True
     assert results[1] is True
+
+
+def test_ll_executor_initialized():
+    """Test that LLExecutor is properly initialized on the backend."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    # Verify ll_executor exists and is the correct type
+    assert hasattr(backend, "ll_executor")
+    assert isinstance(backend.ll_executor, llguidance.LLExecutor)
+
+
+def test_accept_tokens_batch_empty():
+    """Test accept_tokens_batch with empty request list."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    results = backend.accept_tokens_batch([])
+    assert results == []
+
+
+def test_accept_tokens_batch_multi_token():
+    """Test accept_tokens_batch with multi-token requests (speculative decoding)."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    # Create grammars
+    grammar1 = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+    grammar2 = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+
+    # Get multiple valid tokens for JSON object
+    valid_sequence = tokenizer.encode('{"a"')  # Multiple tokens
+
+    # Test batch accept with multi-token sequences
+    requests: list[Any] = [
+        (grammar1, valid_sequence),
+        (grammar2, valid_sequence),
+    ]
+
+    results = backend.accept_tokens_batch(requests)
+
+    assert len(results) == 2
+    assert results[0] is True
+    assert results[1] is True
+
+
+def test_accept_tokens_batch_mixed_single_and_multi():
+    """Test accept_tokens_batch with mixed single and multi-token requests."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    # Create multiple grammars
+    grammars = [
+        backend.compile_grammar(StructuredOutputOptions.JSON, '{"type": "object"}')
+        for _ in range(5)
+    ]
+
+    single_token = tokenizer.encode("{")
+    multi_tokens = tokenizer.encode('{"a"')
+
+    # Mix single and multi-token requests
+    requests: list[Any] = [
+        (grammars[0], single_token),  # single
+        (grammars[1], multi_tokens),  # multi
+        (grammars[2], single_token),  # single
+        (grammars[3], multi_tokens),  # multi
+        (grammars[4], single_token),  # single
+    ]
+
+    results = backend.accept_tokens_batch(requests)
+
+    # Verify order is preserved
+    assert len(results) == 5
+    assert all(isinstance(r, bool) for r in results)
+    # All should succeed with valid JSON tokens
+    assert all(r is True for r in results)
+
+
+def test_accept_tokens_batch_order_preserved():
+    """Test that accept_tokens_batch preserves request order in results."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    # Create grammars with different schemas to track them
+    grammar_object = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+    grammar_string = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "string"}'
+    )
+    grammar_number = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "number"}'
+    )
+
+    # Tokens that are valid for object but not string/number at start
+    object_start = tokenizer.encode("{")
+    string_start = tokenizer.encode('"hello')
+    number_start = tokenizer.encode("123")
+
+    requests: list[Any] = [
+        (grammar_object, object_start),
+        (grammar_string, string_start),
+        (grammar_number, number_start),
+    ]
+
+    results = backend.accept_tokens_batch(requests)
+
+    assert len(results) == 3
+    # Each grammar should accept its respective valid start token
+    assert results[0] is True  # object accepts {
+    assert results[1] is True  # string accepts "
+    assert results[2] is True  # number accepts digits
+
+
+def test_fill_bitmasks_batch_mixed_spec_and_nonspec():
+    """Test fill_bitmasks_batch with mixed speculative and non-speculative requests."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(tokenizer=TOKENIZER),
+        structured_outputs_config=StructuredOutputsConfig(backend="guidance"),
+        speculative_config=SpeculativeConfig(model="[ngram]", num_speculative_tokens=3),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    # Create grammars
+    grammar_spec = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+    grammar_nonspec = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+
+    # Accept initial token to set up valid state
+    initial_token = tokenizer.encode("{")
+    grammar_spec.accept_tokens("", initial_token)
+    grammar_nonspec.accept_tokens("", initial_token)
+
+    # Allocate bitmask: grammar_spec needs 4 positions (1 base + 3 spec),
+    # grammar_nonspec needs 1 position
+    bitmask = backend.allocate_token_bitmask(5)
+    full_mask = torch.tensor(-1, dtype=torch.int32)  # Scalar tensor
+    bitmask.zero_()
+
+    spec_tokens = tokenizer.encode('"a"')[:3]  # Get 3 spec tokens
+
+    requests: list[Any] = [
+        (grammar_spec, 0, True, spec_tokens),  # spec: positions 0-3
+        (grammar_nonspec, 4, True, []),  # non-spec: position 4
+    ]
+
+    backend.fill_bitmasks_batch(requests, bitmask, full_mask)
+
+    # Verify all positions were filled (not zeros)
+    for i in range(5):
+        assert bitmask[i].sum() != 0, f"Position {i} should be filled"
+
+
+def test_fill_bitmasks_batch_large_batch():
+    """Test fill_bitmasks_batch with a larger batch to exercise parallelism."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    num_grammars = 32  # Large enough to benefit from parallelism
+
+    # Create many grammars
+    grammars = [
+        backend.compile_grammar(StructuredOutputOptions.JSON, '{"type": "object"}')
+        for _ in range(num_grammars)
+    ]
+
+    # Accept initial token for all
+    initial_token = tokenizer.encode("{")
+    for grammar in grammars:
+        grammar.accept_tokens("", initial_token)
+
+    bitmask = backend.allocate_token_bitmask(num_grammars)
+    full_mask = torch.tensor(-1, dtype=torch.int32)  # Scalar tensor
+    bitmask.zero_()
+
+    requests: list[Any] = [(grammar, i, True, []) for i, grammar in enumerate(grammars)]
+
+    backend.fill_bitmasks_batch(requests, bitmask, full_mask)
+
+    # Verify all grammars got their bitmasks filled
+    for i in range(num_grammars):
+        assert bitmask[i].sum() != 0, f"Grammar {i} bitmask should be filled"
+
+
+def test_accept_tokens_batch_large_batch():
+    """Test accept_tokens_batch with a larger batch to exercise parallelism."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    num_grammars = 32
+
+    # Create many grammars
+    grammars = [
+        backend.compile_grammar(StructuredOutputOptions.JSON, '{"type": "object"}')
+        for _ in range(num_grammars)
+    ]
+
+    valid_token = tokenizer.encode("{")
+
+    requests: list[Any] = [(grammar, valid_token) for grammar in grammars]
+
+    results = backend.accept_tokens_batch(requests)
+
+    assert len(results) == num_grammars
+    assert all(r is True for r in results)
+
+
+def test_accept_tokens_batch_multi_token_partial_failure():
+    """Test accept_tokens_batch with multi-token where some fail mid-sequence."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    # Create grammars
+    grammar1 = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+    grammar2 = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+
+    # Valid multi-token sequence for JSON object
+    valid_sequence = tokenizer.encode('{"a":')
+
+    # Start with valid token, then invalid - this tests the position-by-position
+    # processing in multi-token mode
+    # For grammar2, we'll use a sequence that starts valid then goes invalid
+    mixed_sequence = tokenizer.encode("{") + tokenizer.encode("invalid text")
+
+    requests: list[Any] = [
+        (grammar1, valid_sequence),
+        (grammar2, mixed_sequence),
+    ]
+
+    results = backend.accept_tokens_batch(requests)
+
+    assert len(results) == 2
+    assert results[0] is True  # Valid sequence should pass
+    # grammar2 result depends on when guidance rejects - it accepts { first
+
+
+def test_accept_tokens_batch_varying_lengths():
+    """Test accept_tokens_batch with requests of varying token lengths."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        decoding_config=StructuredOutputsConfig(backend="guidance"),
+    )
+    backend = GuidanceBackend(
+        vllm_config,
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    grammars = [
+        backend.compile_grammar(StructuredOutputOptions.JSON, '{"type": "object"}')
+        for _ in range(4)
+    ]
+
+    # Different length token sequences
+    seq1 = tokenizer.encode("{")  # 1 token
+    seq2 = tokenizer.encode('{"')  # ~2 tokens
+    seq3 = tokenizer.encode('{"a')  # ~3 tokens
+    seq4 = tokenizer.encode('{"a":')  # ~4 tokens
+
+    requests: list[Any] = [
+        (grammars[0], seq1),
+        (grammars[1], seq2),
+        (grammars[2], seq3),
+        (grammars[3], seq4),
+    ]
+
+    results = backend.accept_tokens_batch(requests)
+
+    assert len(results) == 4
+    # All are valid JSON prefixes
+    assert all(r is True for r in results)

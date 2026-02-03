@@ -95,6 +95,7 @@ class GuidanceBackend(StructuredOutputBackend):
         self.ll_tokenizer = llguidance_hf.from_tokenizer(
             self.tokenizer, self.vocab_size
         )
+        self.ll_executor = llguidance.LLExecutor()
 
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
@@ -126,8 +127,128 @@ class GuidanceBackend(StructuredOutputBackend):
             max_num_seqs, self.ll_tokenizer.vocab_size
         )
 
+    def fill_bitmasks_batch(
+        self,
+        requests_data: list[tuple[StructuredOutputGrammar, int, bool, list[int]]],
+        bitmask: torch.Tensor,
+        full_mask: torch.Tensor,
+    ) -> None:
+        """Fill bitmasks using native Rust parallelism.
+
+        Automatically uses the optimized draft token API when spec_tokens is
+        non-empty.
+
+        Args:
+            requests_data: List of (grammar, start_index, apply_bitmask,
+                           spec_tokens) tuples
+            bitmask: The bitmask tensor to fill
+            full_mask: Scalar tensor with value -1 for non-constrained positions
+        """
+        # Separate requests into non-spec and spec groups
+        non_spec_matchers = []
+        spec_matchers = []
+
+        for grammar, start_index, apply_bitmask, spec_tokens in requests_data:
+            num_positions = len(spec_tokens) + 1
+
+            if not apply_bitmask or grammar.is_terminated():
+                for i in range(num_positions):
+                    bitmask[start_index + i].fill_(full_mask)
+            else:
+                assert isinstance(grammar, GuidanceGrammar)
+                if spec_tokens:
+                    spec_matchers.append((grammar.ll_matcher, start_index, spec_tokens))
+                else:
+                    non_spec_matchers.append((grammar.ll_matcher, start_index))
+
+        # Call appropriate parallel API based on what we have
+        if non_spec_matchers:
+            llguidance_torch.fill_next_token_bitmask_par(
+                self.ll_executor, non_spec_matchers, bitmask
+            )
+        if spec_matchers:
+            llguidance_torch.fill_next_token_bitmask_par_with_draft_tokens(
+                self.ll_executor, spec_matchers, bitmask
+            )
+
     def destroy(self):
         pass
+
+    def accept_tokens_batch(
+        self,
+        requests: list[tuple[StructuredOutputGrammar, list[int]]],
+    ) -> list[bool]:
+        """Accept tokens for multiple grammars in parallel using Rust parallelism.
+
+        For single-token requests, uses parallel consume_token_par().
+        For multi-token requests (speculative decoding), falls back to serial
+        processing until llguidance adds native multi-token batch support.
+
+        Args:
+            requests: List of (grammar, token_ids) tuples. token_ids can be
+                      a single token or multiple tokens (for speculative decoding).
+
+        Returns:
+            List[bool]: Success/failure for each grammar (in order).
+        """
+        if not requests:
+            return []
+
+        # Separate single-token and multi-token requests
+        single_token_requests: list[tuple] = []
+        multi_token_requests: list[tuple[GuidanceGrammar, list[int]]] = []
+        request_order: list[tuple[str, int]] = []  # Track original order
+
+        for i, (grammar, token_ids) in enumerate(requests):
+            assert isinstance(grammar, GuidanceGrammar)
+            if len(token_ids) == 1:
+                single_token_requests.append((grammar.ll_matcher, token_ids[0]))
+                request_order.append(("single", len(single_token_requests) - 1))
+            else:
+                multi_token_requests.append((grammar, token_ids))
+                request_order.append(("multi", len(multi_token_requests) - 1))
+
+        # Process single-token requests in parallel
+        single_results: list[bool] = []
+        if single_token_requests:
+            single_results = llguidance_torch.consume_token_par(
+                self.ll_executor, single_token_requests
+            )
+
+        # Process multi-token requests by stepping through token positions
+        # Instead of N serial accept_tokens calls, do max_len parallel batch calls
+        multi_results: list[bool] = [True] * len(multi_token_requests)
+        if multi_token_requests:
+            max_tokens = max(len(tokens) for _, tokens in multi_token_requests)
+
+            for pos in range(max_tokens):
+                # Collect (matcher, token) for requests that have a token at this
+                # position and haven't failed yet
+                batch: list[tuple] = []
+                batch_to_multi_idx: list[int] = []
+
+                for multi_idx, (grammar, tokens) in enumerate(multi_token_requests):
+                    if pos < len(tokens) and multi_results[multi_idx]:
+                        batch.append((grammar.ll_matcher, tokens[pos]))
+                        batch_to_multi_idx.append(multi_idx)
+
+                if batch:
+                    pos_results = llguidance_torch.consume_token_par(
+                        self.ll_executor, batch
+                    )
+                    for i, success in enumerate(pos_results):
+                        if not success:
+                            multi_results[batch_to_multi_idx[i]] = False
+
+        # Reassemble results in original order
+        results: list[bool] = []
+        for req_type, idx in request_order:
+            if req_type == "single":
+                results.append(single_results[idx])
+            else:
+                results.append(multi_results[idx])
+
+        return results
 
 
 @dataclass
@@ -152,7 +273,6 @@ class GuidanceGrammar(StructuredOutputGrammar):
         Returns True if the parser was advanced successfully.
         Returns False if the parser failed to advance.
         """
-
         if self.ll_tokenizer.eos_token in tokens:
             if self.ll_matcher.is_stopped() and not self.terminated:
                 self.rollback_lag = 1
