@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -3413,3 +3414,200 @@ def test_prepend_skipped_requests_order():
 
     # verify waiting order is preserved
     assert list(scheduler.waiting) == expected_waiting_reqs
+
+
+# ==============================================================================
+# Grammar bitmask tests
+# ==============================================================================
+
+
+def test_get_grammar_bitmask_skips_chunked_prefill():
+    """Verify requests still in chunked prefill are excluded from grammar bitmask.
+
+    When a request has use_structured_output=True but num_computed_tokens <
+    num_prompt_tokens (still in prefill), it should NOT be included in
+    structured_output_request_ids.
+    """
+    scheduler = create_scheduler()
+
+    # Create a request with structured output params
+    structured_outputs_params = StructuredOutputsParams(regex="[0-9]+")
+    sampling_params = SamplingParams(
+        ignore_eos=False,
+        max_tokens=16,
+        structured_outputs=structured_outputs_params,
+    )
+    request = Request(
+        request_id="structured_req",
+        prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],  # 10 tokens
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        eos_token_id=EOS_TOKEN_ID,
+    )
+
+    # Manually add to scheduler.requests and set num_computed_tokens < num_prompt_tokens
+    # This simulates a request in chunked prefill
+    request.num_computed_tokens = 5  # Less than num_prompt_tokens (10)
+    scheduler.requests[request.request_id] = request
+
+    # Create a minimal scheduler output with the request
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 5},
+        total_num_scheduled_tokens=5,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    # Mock the structured_output_manager so we don't need actual grammar setup
+    with patch.object(scheduler, "structured_output_manager") as _mock_so_manager:
+        result = scheduler.get_grammar_bitmask(scheduler_output)
+
+    # Since the request is still in chunked prefill, it should NOT be included
+    # Therefore, get_grammar_bitmask should return None (no requests to process)
+    assert result is None
+
+
+def test_get_grammar_bitmask_includes_completed_prefill():
+    """Verify requests past prefill are included in grammar bitmask.
+
+    When a request has use_structured_output=True and num_computed_tokens >=
+    num_prompt_tokens (past prefill), it should be included in
+    structured_output_request_ids.
+    """
+    scheduler = create_scheduler()
+
+    # Create a request with structured output params
+    structured_outputs_params = StructuredOutputsParams(regex="[0-9]+")
+    sampling_params = SamplingParams(
+        ignore_eos=False,
+        max_tokens=16,
+        structured_outputs=structured_outputs_params,
+    )
+    request = Request(
+        request_id="structured_req",
+        prompt_token_ids=[0, 1, 2, 3, 4],  # 5 tokens
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        eos_token_id=EOS_TOKEN_ID,
+    )
+
+    # Manually set num_computed_tokens >= num_prompt_tokens (past prefill)
+    request.num_computed_tokens = 5  # Equal to num_prompt_tokens
+    scheduler.requests[request.request_id] = request
+
+    # Create a scheduler output with the request
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},  # Decode phase
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    # Mock the structured_output_manager to return a dummy bitmask
+    dummy_bitmask = np.zeros((1, 10), dtype=np.int32)
+    with patch.object(
+        scheduler,
+        "structured_output_manager",
+    ) as mock_so_manager:
+        mock_so_manager.grammar_bitmask.return_value = dummy_bitmask
+        result = scheduler.get_grammar_bitmask(scheduler_output)
+
+    # Since the request is past prefill and has structured output,
+    # it should be included
+    assert result is not None
+    assert result.structured_output_request_ids == ["structured_req"]
+    mock_so_manager.grammar_bitmask.assert_called_once()
+
+
+def test_update_from_output_batch_accept_tokens():
+    """Verify update_from_output calls accept_tokens_batch for structured outputs.
+
+    When processing multiple requests with structured output enabled,
+    update_from_output should collect grammar/token pairs and call
+    accept_tokens_batch once with all of them.
+    """
+    scheduler = create_scheduler()
+
+    # Create requests with structured output params
+    structured_outputs_params = StructuredOutputsParams(regex="[0-9]+")
+    sampling_params = SamplingParams(
+        ignore_eos=False,
+        max_tokens=16,
+        structured_outputs=structured_outputs_params,
+    )
+
+    # Create mock grammars for the requests
+    mock_grammar1 = MagicMock()
+    mock_grammar2 = MagicMock()
+
+    # Create and set up requests
+    requests = []
+    for i, mock_grammar in enumerate([mock_grammar1, mock_grammar2]):
+        request = Request(
+            request_id=f"req_{i}",
+            prompt_token_ids=[0, 1, 2, 3, 4],
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            eos_token_id=EOS_TOKEN_ID,
+        )
+        # Set up the request as past prefill with a mock grammar
+        request.num_computed_tokens = 5
+        # Mock structured_output_request with grammar
+        request.structured_output_request = MagicMock()
+        request.structured_output_request.grammar = mock_grammar
+        scheduler.requests[request.request_id] = request
+        scheduler.running.append(request)
+        requests.append(request)
+
+    # Create scheduler output
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req_0": 1, "req_1": 1},
+        total_num_scheduled_tokens=2,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    # Create model runner output with sampled tokens
+    model_runner_output = ModelRunnerOutput(
+        req_ids=["req_0", "req_1"],
+        req_id_to_index={"req_0": 0, "req_1": 1},
+        sampled_token_ids=[[100], [200]],  # New tokens for each request
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    # Patch accept_tokens_batch to track calls
+    with patch.object(
+        scheduler.structured_output_manager, "accept_tokens_batch"
+    ) as mock_batch:
+        mock_batch.return_value = [True, True]  # Both succeed
+        scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    # Verify accept_tokens_batch was called once with both grammar/token pairs
+    mock_batch.assert_called_once()
+    call_args = mock_batch.call_args[0][0]
+    assert len(call_args) == 2
+    # Check that we got the right grammar/token pairs
+    assert call_args[0][0] == mock_grammar1
+    assert call_args[0][1] == [100]
+    assert call_args[1][0] == mock_grammar2
+    assert call_args[1][1] == [200]

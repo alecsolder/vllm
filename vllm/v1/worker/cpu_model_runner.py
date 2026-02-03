@@ -5,10 +5,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import xgrammar as xgr
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -83,6 +85,31 @@ class CPUModelRunner(GPUModelRunner):
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         # Note: For CPU backend, dp padding is not required for now.
         return 0, None
+
+    def _apply_grammar_bitmask(
+        self,
+        logits: torch.Tensor,
+        grammar_output: GrammarOutput,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Apply grammar bitmask constraints to logits using xgrammar (CPU).
+
+        Overrides the GPU implementation which uses Triton kernels.
+        """
+        # Build index mapping from request order to grammar bitmask order
+        grammar_req_id_to_idx = {
+            req_id: i
+            for i, req_id in enumerate(grammar_output.structured_output_request_ids)
+        }
+        indices = [
+            grammar_req_id_to_idx.get(req_id, -1) for req_id in self.input_batch.req_ids
+        ]
+
+        # Filter to valid indices and convert to tensor
+        valid_indices = torch.tensor([i for i in indices if i >= 0], dtype=torch.int32)
+        bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
+
+        xgr.apply_token_bitmask_inplace(logits, bitmask, indices=valid_indices)
 
 
 @contextmanager

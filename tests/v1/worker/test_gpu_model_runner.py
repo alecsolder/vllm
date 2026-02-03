@@ -1196,3 +1196,104 @@ def test_is_uniform_decode() -> None:
         num_reqs=15,
         force_uniform_decode=False,
     )
+
+
+# ==============================================================================
+# _compute_spec_decode_mapping tests
+# ==============================================================================
+
+
+def test_compute_spec_decode_mapping_basic():
+    """Test mapping computation for regular decoding (no spec tokens)."""
+    from vllm.v1.worker.gpu.structured_outputs import _compute_spec_decode_mapping
+
+    req_ids = ["req1", "req2"]
+    grammar_req_ids = ["req1"]
+    scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+
+    mapping = _compute_spec_decode_mapping(
+        req_ids, grammar_req_ids, scheduled_spec_decode_tokens
+    )
+
+    # req1 maps to bitmask index 0, req2 has no grammar so maps to -1
+    assert mapping == [0, -1]
+
+
+def test_compute_spec_decode_mapping_with_spec_tokens():
+    """Test mapping with speculative decoding tokens."""
+    from vllm.v1.worker.gpu.structured_outputs import _compute_spec_decode_mapping
+
+    req_ids = ["req1", "req2"]
+    grammar_req_ids = ["req1", "req2"]
+    scheduled_spec_decode_tokens = {"req1": [1, 2], "req2": [3]}
+
+    mapping = _compute_spec_decode_mapping(
+        req_ids, grammar_req_ids, scheduled_spec_decode_tokens
+    )
+
+    # req1: 3 positions (base + 2 spec) -> bitmask indices [0, 1, 2]
+    # req2: 2 positions (base + 1 spec) -> bitmask indices [3, 4]
+    # Full mapping: [0, 1, 2, 3, 4]
+    assert mapping == [0, 1, 2, 3, 4]
+
+
+def test_compute_spec_decode_mapping_partial_grammar():
+    """Test when only some requests have grammar constraints."""
+    from vllm.v1.worker.gpu.structured_outputs import _compute_spec_decode_mapping
+
+    req_ids = ["req1", "req2", "req3"]
+    grammar_req_ids = ["req2"]
+    scheduled_spec_decode_tokens = {"req1": [1], "req2": [2], "req3": [3]}
+
+    mapping = _compute_spec_decode_mapping(
+        req_ids, grammar_req_ids, scheduled_spec_decode_tokens
+    )
+
+    # req1: 2 positions, no grammar -> [-1, -1]
+    # req2: 2 positions, has grammar -> [0, 1]
+    # req3: 2 positions, no grammar -> [-1, -1]
+    assert mapping == [-1, -1, 0, 1, -1, -1]
+
+
+# ==============================================================================
+# GrammarInputBuffers tests
+# ==============================================================================
+
+
+def test_grammar_input_buffers_initialization():
+    """Test GrammarInputBuffers allocates correct buffer sizes."""
+    from vllm.v1.worker.gpu_model_runner import GrammarInputBuffers
+
+    buffers = GrammarInputBuffers(
+        max_num_reqs=10,
+        vocab_size=50257,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        max_num_spec_tokens=0,
+    )
+
+    # grammar_bitmask shape: (max_num_reqs, ceil(vocab_size/32))
+    # ceil(50257/32) = 1571
+    assert buffers.grammar_bitmask.np.shape == (10, 1571)
+    # bitmask_indices shape: (max_num_reqs,)
+    assert buffers.bitmask_indices.np.shape == (10,)
+
+
+def test_grammar_input_buffers_with_spec_tokens():
+    """Test buffer sizing accounts for speculative tokens."""
+    from vllm.v1.worker.gpu_model_runner import GrammarInputBuffers
+
+    buffers = GrammarInputBuffers(
+        max_num_reqs=10,
+        vocab_size=50257,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        max_num_spec_tokens=5,
+    )
+
+    # With spec tokens: max_bitmask_rows = max_num_reqs * (1 + max_num_spec_tokens)
+    # = 10 * (1 + 5) = 60
+    # grammar_bitmask shape: (60, ceil(50257/32)) = (60, 1571)
+    assert buffers.grammar_bitmask.np.shape == (60, 1571)
+    # bitmask_indices shape: (60,)
+    assert buffers.bitmask_indices.np.shape == (60,)

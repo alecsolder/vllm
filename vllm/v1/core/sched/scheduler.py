@@ -54,7 +54,10 @@ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
-from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output import (
+    StructuredOutputGrammar,
+    StructuredOutputManager,
+)
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
@@ -1189,16 +1192,16 @@ class Scheduler(SchedulerInterface):
     def get_grammar_bitmask(
         self, scheduler_output: SchedulerOutput
     ) -> GrammarOutput | None:
-        # Collect list of scheduled request ids that use structured output.
-        # The corresponding rows of the bitmask will be in this order.
-        # PERF: in case of chunked prefill,
-        # request might not include any new tokens.
-        # Therefore, we might introduce some additional
-        # cycle to fill in the bitmask, which could be a big no-op.
+        # Only include requests that actually use structured output
+        # Skip requests still in chunked prefill - they won't sample tokens
+        # and their bitmasks would be wasted computation
         structured_output_request_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
-            if (req := self.requests.get(req_id)) and req.use_structured_output
+            if req_id in self.requests
+            and self.requests[req_id].use_structured_output
+            and self.requests[req_id].num_computed_tokens
+            >= self.requests[req_id].num_prompt_tokens
         ]
         if not structured_output_request_ids:
             return None
@@ -1252,6 +1255,11 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+
+        # Collect grammar/token pairs for batch accept_tokens processing
+        # Format: (req_id, grammar, token_ids) where token_ids is always a list
+        batch_accept_tokens: list[tuple[str, StructuredOutputGrammar, list[int]]] = []
+
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1344,14 +1352,10 @@ class Scheduler(SchedulerInterface):
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                ok = struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
-                if not ok:
-                    logger.warning(
-                        "Unexpected: grammar rejected tokens %s for request %s.",
-                        new_token_ids,
-                        req_id,
-                    )
+                grammar = struct_output_request.grammar
+                assert grammar is not None
+                # Include req_id for warning logging on failures
+                batch_accept_tokens.append((req_id, grammar, new_token_ids))
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -1385,6 +1389,21 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        # Batch process accept_tokens calls
+        if batch_accept_tokens:
+            batch_items = [
+                (grammar, tokens) for _, grammar, tokens in batch_accept_tokens
+            ]
+            results = self.structured_output_manager.accept_tokens_batch(batch_items)
+
+            for (req_id, _, token_ids), success in zip(batch_accept_tokens, results):
+                if not success:
+                    logger.warning(
+                        "Unexpected: grammar rejected tokens %s for request %s.",
+                        token_ids,
+                        req_id,
+                    )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
