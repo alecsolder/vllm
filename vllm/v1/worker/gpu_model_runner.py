@@ -157,7 +157,6 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
-from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
@@ -166,6 +165,7 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.structured_outputs import apply_grammar_bitmask
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -196,6 +196,46 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+class GrammarInputBuffers:
+    """Minimal buffer class for grammar bitmask operations.
+
+    Satisfies the interface expected by gpu/structured_outputs.py:apply_grammar_bitmask
+    which only accesses .grammar_bitmask and .bitmask_indices attributes.
+
+    For speculative decoding, each request needs (1 + num_spec_tokens) bitmask rows:
+    one for each speculative position plus one for the bonus token.
+    """
+
+    grammar_bitmask: CpuGpuBuffer
+    bitmask_indices: CpuGpuBuffer
+
+    def __init__(
+        self,
+        max_num_reqs: int,
+        vocab_size: int,
+        device: torch.device,
+        pin_memory: bool = True,
+        max_num_spec_tokens: int = 0,
+    ):
+        # With speculative decoding, we need space for multiple bitmask rows
+        # per request: one for each speculative position plus the bonus token.
+        max_bitmask_rows = max_num_reqs * (1 + max_num_spec_tokens)
+
+        self.grammar_bitmask = CpuGpuBuffer(
+            max_bitmask_rows,
+            cdiv(vocab_size, 32),
+            dtype=torch.int32,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        self.bitmask_indices = CpuGpuBuffer(
+            max_bitmask_rows,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=pin_memory,
+        )
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -532,6 +572,18 @@ class GPUModelRunner(
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+        )
+
+        # Grammar bitmask buffers for optimized structured output
+        max_num_spec_tokens = 0
+        if self.speculative_config is not None:
+            max_num_spec_tokens = self.speculative_config.num_speculative_tokens
+        self.grammar_input_buffers = GrammarInputBuffers(
+            max_num_reqs=self.max_num_reqs,
+            vocab_size=self.model_config.get_vocab_size(),
+            device=self.device,
+            pin_memory=self.pin_memory,
+            max_num_spec_tokens=max_num_spec_tokens,
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -3654,9 +3706,7 @@ class GPUModelRunner(
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
-            )
+            self._apply_grammar_bitmask(logits, grammar_output, scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -3804,6 +3854,26 @@ class GPUModelRunner(
             )
 
         return async_output
+
+    def _apply_grammar_bitmask(
+        self,
+        logits: torch.Tensor,
+        grammar_output: "GrammarOutput",
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Apply grammar bitmask constraints to logits using Triton kernel.
+
+        This method is overridden in CPUModelRunner to use xgrammar instead,
+        since Triton kernels require GPU.
+        """
+        apply_grammar_bitmask(
+            logits,
+            self.input_batch.req_ids,
+            grammar_output.structured_output_request_ids,
+            grammar_output.grammar_bitmask,
+            self.grammar_input_buffers,
+            scheduler_output.scheduled_spec_decode_tokens or None,
+        )
 
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
