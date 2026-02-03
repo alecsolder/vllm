@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import itertools
 import multiprocessing
-from collections.abc import Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
@@ -52,16 +50,6 @@ class StructuredOutputManager:
 
         self._grammar_bitmask: torch.Tensor | None = None
         self._full_mask = torch.tensor(-1, dtype=torch.int32)
-
-        max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
-        self.fill_bitmask_parallel_threshold = 128
-        if self.fill_bitmask_parallel_threshold < max_batch_size:
-            self.fill_bitmask_parallel_batch_size = 16
-            # Use:
-            # - at least 1 CPU
-            # - at most half the number of CPUs or 8, whichever is less
-            max_workers = max(1, min(multiprocessing.cpu_count() // 2, 8))
-            self.executor_for_fillmask = ThreadPoolExecutor(max_workers=max_workers)
 
         if not self.vllm_config.model_config.skip_tokenizer_init:
             # The default max_workers if not specified is the number of
@@ -164,24 +152,6 @@ class StructuredOutputManager:
         assert self.backend is not None
         return self.backend.compile_grammar(request_type, grammar_spec)
 
-    def _fill_bitmasks(
-        self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
-    ) -> None:
-        assert self._grammar_bitmask is not None
-        for grammar, index, apply_bitmask in batch:
-            if apply_bitmask and not grammar.is_terminated():
-                grammar.fill_bitmask(self._grammar_bitmask, index)
-            else:
-                # Note that for thinking support, we will need to
-                # reset the relevant part of the bitmask for consequent
-                # requests here.
-                self._grammar_bitmask[index].fill_(self._full_mask)
-
-    def _async_submit_fill_bitmask(
-        self, batch: list[tuple[StructuredOutputGrammar, int, bool]]
-    ) -> Future:
-        return self.executor_for_fillmask.submit(self._fill_bitmasks, batch)
-
     def grammar_bitmask(
         self,
         requests: dict[str, "Request"],
@@ -192,12 +162,6 @@ class StructuredOutputManager:
         if not structured_output_request_ids:
             return None
 
-        max_num_spec_tokens = 0
-        if self.vllm_config.speculative_config is not None:
-            max_num_spec_tokens = (
-                self.vllm_config.speculative_config.num_speculative_tokens
-            )
-
         if self._grammar_bitmask is None:
             assert self.backend is not None
             max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
@@ -206,70 +170,36 @@ class StructuredOutputManager:
             # one for each speculative position, and one more for the
             # bonus token / non-speculative token.
             self._grammar_bitmask = self.backend.allocate_token_bitmask(
-                max_batch_size * (1 + max_num_spec_tokens)
+                max_batch_size * (1 + self.backend.max_num_spec_tokens)
             )
 
         # Generate a batched bitmask for all structured output requests.
         # When speculative decoding is enabled, we need to include multiple
         # masks for each request, one for each possible bonus token position.
         # These are stored inline in the tensor and unpacked by the gpu runner.
+        # Single unified loop - always include spec_tokens (empty list if not
+        # speculative). The backend internally decides which code path to use.
+        requests_data = []
         cumulative_index = 0
+        for req_id in structured_output_request_ids:
+            request = requests[req_id]
+            structured_output_request = request.structured_output_request
+            if TYPE_CHECKING:
+                assert structured_output_request is not None
+                assert structured_output_request.grammar is not None
+            grammar = structured_output_request.grammar
+            apply_bitmask = self.should_fill_bitmask(request)
+            spec_tokens = scheduled_spec_decode_tokens.get(req_id, [])
 
-        # Optimized parallel filling of bitmasks for
-        # non-spec, large-batch-size cases
-        if (
-            len(structured_output_request_ids) > self.fill_bitmask_parallel_threshold
-            and max_num_spec_tokens == 0
-        ):
-            promises = []
-            batch = []
-            for req_id in structured_output_request_ids:
-                request = requests[req_id]
-                structured_output_request = request.structured_output_request
-                if TYPE_CHECKING:
-                    assert structured_output_request is not None
-                    assert structured_output_request.grammar is not None
-                grammar = structured_output_request.grammar
+            requests_data.append(
+                (grammar, cumulative_index, apply_bitmask, spec_tokens)
+            )
+            cumulative_index += len(spec_tokens) + 1
 
-                apply_bitmask = self.should_fill_bitmask(request)
-                batch.append((grammar, cumulative_index, apply_bitmask))
-                if len(batch) == self.fill_bitmask_parallel_batch_size:
-                    promises.append(self._async_submit_fill_bitmask(batch))
-                    batch = []
-
-                cumulative_index += 1
-            if batch:
-                promises.append(self._async_submit_fill_bitmask(batch))
-
-            # Wait for all bitmask filling tasks to complete.
-            for promise in promises:
-                promise.result()
-        else:
-            # Fallback to serial filling of bitmasks for small-batch-size cases
-            for req_id in structured_output_request_ids:
-                request = requests[req_id]
-                structured_output_request = request.structured_output_request
-
-                if TYPE_CHECKING:
-                    assert structured_output_request is not None
-                    assert structured_output_request.grammar is not None
-                grammar = structured_output_request.grammar
-                apply_bitmask = self.should_fill_bitmask(request)
-
-                state_advancements = 0
-                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
-                for token in itertools.chain(req_tokens, (-1,)):
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
-                    if token == -1:
-                        # Stop advancing the grammar once we hit a padding token.
-                        apply_bitmask = False
-                    if apply_bitmask and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
-                        assert accepted, (token, req_id, scheduled_spec_decode_tokens)
-                        state_advancements += 1
-                    cumulative_index += 1
-                if state_advancements > 0:
-                    grammar.rollback(state_advancements)
+        assert self.backend is not None
+        self.backend.fill_bitmasks_batch(
+            requests_data, self._grammar_bitmask, self._full_mask
+        )
 
         bitmask_tensor = self._grammar_bitmask
         if cumulative_index < bitmask_tensor.shape[0]:
@@ -329,6 +259,26 @@ class StructuredOutputManager:
             structured_req.reasoning_ended = True
 
         return False
+
+    def accept_tokens_batch(
+        self,
+        requests: list[tuple["StructuredOutputGrammar", list[int]]],
+    ) -> list[bool]:
+        """Accept tokens for a batch of requests.
+
+        Delegates to backend's accept_tokens_batch() method.
+
+        Args:
+            requests: List of (grammar, token_ids) tuples.
+
+        Returns:
+            List of success/failure booleans for each request.
+        """
+        if not requests:
+            return []
+
+        assert self.backend is not None
+        return self.backend.accept_tokens_batch(requests)
 
     def clear_backend(self) -> None:
         if self.backend is not None:
