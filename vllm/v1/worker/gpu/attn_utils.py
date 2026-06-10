@@ -394,7 +394,7 @@ def build_attn_metadata(
     positions: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
-    causal: bool = True,
+    causal: bool | torch.Tensor = True,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
