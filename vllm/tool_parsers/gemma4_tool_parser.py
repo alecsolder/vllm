@@ -421,7 +421,50 @@ class Gemma4ToolParser(ToolParser):
             # delimiters to be stripped on /v1/responses, leaking raw
             # `call:fn{...}` text via output_text.delta).
             request.skip_special_tokens = False
+        self._maybe_attach_diffusion_toolcall_grammar(request)
         return request
+
+    def _maybe_attach_diffusion_toolcall_grammar(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> None:
+        """Attach a worker-side grammar for DiffusionGemma tool calling.
+
+        The autoregressive structured-output state machine cannot advance a
+        parallel diffusion canvas one token at a time, so this grammar is
+        carried separately and consumed by the diffusion sampler.
+        """
+        import vllm.envs as envs
+
+        if envs.VLLM_DIFFUSION_CONSTRAINED_DECODE != "1":
+            return
+        if not isinstance(request, ChatCompletionRequest):
+            return
+        if not request.tools or request.tool_choice not in ("auto", None):
+            return
+        if request.structured_outputs is not None:
+            return
+        try:
+            from vllm.v1.structured_output.gemma_chat_grammar import (
+                generate_gemma4_chat_grammar,
+            )
+
+            tool_dicts = [t.model_dump() for t in request.tools]
+            # The answer block may contain either tool calls or a natural-language
+            # response. Reasoning, when enabled, is generated in an earlier block.
+            grammar = generate_gemma4_chat_grammar(
+                tools=tool_dicts,
+                json_schema=None,
+                allow_natural_language=True,
+                allow_thinking=False,
+            )
+            if grammar:
+                request._diffusion_toolcall_grammar = grammar
+        except Exception:  # noqa: BLE001
+            logger.warning_once(
+                "Gemma4 diffusion tool-call grammar: failed to compose the "
+                "call-span grammar from tools; this request runs without "
+                "the diffusion grammar constraint."
+            )
 
     # ------------------------------------------------------------------
     # Delta buffering for multi-token special sequences

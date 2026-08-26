@@ -2033,6 +2033,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # Enable the experimental grammar-constrained decoder for DiffusionGemma.
+    # It is disabled by default and propagated to spawned model workers here.
+    "VLLM_DIFFUSION_CONSTRAINED_DECODE": lambda: os.getenv(
+        "VLLM_DIFFUSION_CONSTRAINED_DECODE", "0"
+    ),
 }
 
 
