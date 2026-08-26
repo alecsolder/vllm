@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
+    from vllm.v1.structured_output.backend_guidance import GuidanceGrammar
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -25,6 +26,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    GuidanceGrammar = object
 
 
 @dataclass
@@ -261,3 +263,13 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
+    # Per-req jump-decoding forced-token writes, keyed by req_id → the list of
+    # K grammar-forced token ids to stage into the spec-decode draft buffer.
+    # Computed in EngineCore (the scheduler process, where the grammar matchers
+    # live) by `Scheduler._compute_predictable_ff_writes` and gated on
+    # `StructuredOutputsConfig.enable_jump_decoding` + an active speculative
+    # config; only this picklable map crosses the executor boundary (TP>1 safe).
+    # The worker re-applies its discard / batch-presence filter at write time
+    # and owns the quick-step firing decision. Empty when JD is disabled, no
+    # speculative config is set, or no req has K post-advance forced tokens.
+    predictable_ff_writes: "dict[str, list[int]]" = field(default_factory=dict)

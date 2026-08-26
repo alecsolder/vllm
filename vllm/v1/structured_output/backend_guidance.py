@@ -32,6 +32,24 @@ else:
 logger = init_logger(__name__)
 
 
+_LL_EXECUTOR: "llguidance.LLExecutor | None" = None
+
+
+def get_ll_executor() -> "llguidance.LLExecutor":
+    """Return the process-wide LLExecutor singleton.
+
+    Lazy-initialized — the executor spins up a rayon thread pool on first
+    construction. One instance per process; assumes UniprocExecutor so
+    scheduler and worker share this singleton in-process for the batched
+    LLExecutor APIs (``compute_ff_tokens_par``,
+    ``unsafe_compute_mask_ptr_with_draft_token``).
+    """
+    global _LL_EXECUTOR
+    if _LL_EXECUTOR is None:
+        _LL_EXECUTOR = llguidance.LLExecutor()
+    return _LL_EXECUTOR
+
+
 def _walk_json_for_additional_properties(data: object):
     if isinstance(data, dict):
         for value in data.values():
@@ -103,7 +121,13 @@ class GuidanceBackend(StructuredOutputBackend):
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
-        self.serialized_grammar = serialize_guidance_grammar(
+        # Local variable, NOT `self.` — `self` is the singleton backend and
+        # `compile_grammar` is invoked from a ThreadPoolExecutor by
+        # `StructuredOutputManager`. Two concurrent compiles would race on
+        # the attribute and the second thread would build its `LLMatcher`
+        # against the first thread's grammar, producing matchers whose
+        # bitmasks are independent of the requested schema.
+        serialized_grammar = serialize_guidance_grammar(
             request_type,
             grammar_spec,
             self.disable_any_whitespace,
@@ -112,7 +136,7 @@ class GuidanceBackend(StructuredOutputBackend):
 
         ll_matcher = llguidance.LLMatcher(
             self.ll_tokenizer,
-            self.serialized_grammar,
+            serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
 
@@ -172,6 +196,8 @@ class GuidanceGrammar(StructuredOutputGrammar):
         # For conversion between the two, see
         # https://github.com/guidance-ai/llguidance/blob/main/docs/fast_forward.md
 
+        # Single batched Rust call. Atomic over the
+        # token list.
         r = self.ll_matcher.consume_tokens(tokens)
 
         self.check_error()
@@ -184,15 +210,13 @@ class GuidanceGrammar(StructuredOutputGrammar):
 
         Returns the prefix list of tokens that are accepted by the parser.
         """
-        if len(tokens) == 0:
-            return []
-        if self.ll_matcher.is_stopped():
+        if not tokens or self.ll_matcher.is_stopped():
             return []
 
-        num_tokens = self.ll_matcher.validate_tokens(tokens)
-
+        # Direct Rust call — live-matcher validate_tokens is non-poisoning
+        # (rollback isolation handled inside the Rust layer).
+        num_tokens = self.ll_matcher.validate_tokens(list(tokens))
         self.check_error()
-
         return tokens[:num_tokens]
 
     def rollback(self, num_tokens: int) -> None:
@@ -210,6 +234,18 @@ class GuidanceGrammar(StructuredOutputGrammar):
 
     def is_terminated(self) -> bool:
         return self.terminated
+
+    def is_stopped(self) -> bool:
+        """Return True if the underlying llguidance matcher has stopped advancing.
+
+        Delegates to ``self.ll_matcher.is_stopped()`` — the same check that
+        ``accept_tokens()``, ``validate_tokens()``, and ``fill_bitmask()`` use
+        internally. The worker matcher loop calls
+        ``matcher.is_stopped()`` directly on the ``GuidanceGrammar`` wrapper;
+        without this delegation it raises ``AttributeError`` on the first
+        active-path matcher iteration.
+        """
+        return self.ll_matcher.is_stopped()
 
     def reset(self):
         # This method may be not needed anymore? TODO

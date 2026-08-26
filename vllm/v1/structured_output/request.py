@@ -27,6 +27,11 @@ class StructuredOutputRequest:
     # Cached per request; do not share reasoning parsers across requests because
     # their behavior can depend on reasoning_parser_kwargs.
     reasoner: "ReasoningParser | None" = None
+    # Unenforced-jump fail-open: set True when a free (unmasked) sampled token
+    # diverged from the grammar. Disables grammar for the rest of this request
+    # (skips matcher advance, FF eligibility, and any bitmask) -> the request
+    # then generates fully free. Only set under jump_decoding_unenforced.
+    disabled: bool = False
 
     @staticmethod
     def from_sampling_params(

@@ -136,11 +136,48 @@ class RejectionSampler(nn.Module):
             predict_bonus_token=True,
             # Override the logprobs mode to return logits because they are
             # needed later to compute the accepted token logprobs.
-            logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
+            logprobs_mode_override=(
+                "processed_logits" if self.is_processed_logprobs_mode else "raw_logits"
+            ),
         )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
+
+        # FF-bypass fast path. When the jump-decoding quick-step in the
+        # prior step wrote K grammar-forced tokens for every req in the
+        # batch (strict `all_ff_step` staged onto `SpecDecodeMetadata`),
+        # the grammar bitmask precondition guarantees acceptance of every
+        # draft: non-FF logits = -inf, so target_argmax == FF in greedy
+        # mode and target_prob[FF] = 1.0 in random mode. Skip
+        # target_logits softmax + argmax + rejection kernel +
+        # recovered_sample; direct-write FFs from the draft buffer + the
+        # freshly-sampled bonus token. Bonus sampler still runs above
+        # (cannot skip; bonus is a fresh sample). Fast path requires
+        # logprobs not be requested (FFs are forced tokens; logprobs are
+        # meaningless for them — if a consumer needs logprobs we fall
+        # back to the full rejection path to compute them). The
+        # precondition holds because the upstream JD fabricate-broadcast
+        # path clamps `prev_sampled<0 → 0`, preventing
+        # `PLACEHOLDER_TOKEN_ID=-1` sentinels from leaking into the
+        # FF-fast-path acceptance.
+        if metadata.all_ff_step and sampling_metadata.max_num_logprobs is None:
+            batch_size = bonus_token_ids.shape[0]
+            K = metadata.max_spec_len
+            # `all_ff_step` precondition: every req has exactly K drafts;
+            # the 1D `draft_token_ids[num_tokens=batch_size*K]` reshapes
+            # cleanly to `[batch_size, K]`.
+            output_token_ids = torch.empty(
+                (batch_size, K + 1),
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            output_token_ids[:, :K] = metadata.draft_token_ids.view(batch_size, K).to(
+                torch.int32
+            )
+            output_token_ids[:, K] = bonus_token_ids[:, 0].to(torch.int32)
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
 
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
@@ -302,7 +339,14 @@ class RejectionSampler(nn.Module):
                 sampling_metadata.spec_token_ids,
             )
 
-        # Calculate indices of target logits.
+        # Calculate indices of target logits. Construct `repeat_indices`
+        # on GPU via `searchsorted` over the already device-resident
+        # `metadata.cu_num_draft_tokens` (cumulative draft-count per
+        # req). For each token position `p` in `[0, total_drafts)`,
+        # `searchsorted(cu, p, right=True)` returns the req whose
+        # cumulative draft count first exceeds `p`. Keeps the index build
+        # on-device (no host→device sync); `total_drafts` is a pure Python
+        # sum over the CPU-resident `metadata.num_draft_tokens`.
         repeat_indices: torch.Tensor | None = None
         need_repeat_indices = (
             sampling_metadata.allowed_token_ids_mask is not None
@@ -310,12 +354,15 @@ class RejectionSampler(nn.Module):
             or needs_thinking
         )
         if need_repeat_indices:
-            num_requests = len(metadata.num_draft_tokens)
-            num_draft_tokens = torch.tensor(metadata.num_draft_tokens, device="cpu")
-            original_indices = torch.arange(num_requests, device="cpu")
-            repeat_indices_cpu = original_indices.repeat_interleave(num_draft_tokens)
-            repeat_indices = repeat_indices_cpu.to(
-                device=logits.device, non_blocking=True
+            total_drafts = sum(metadata.num_draft_tokens)
+            cu_num_draft_tokens = metadata.cu_num_draft_tokens
+            positions = torch.arange(
+                total_drafts,
+                device=logits.device,
+                dtype=cu_num_draft_tokens.dtype,
+            )
+            repeat_indices = torch.searchsorted(
+                cu_num_draft_tokens, positions, right=True
             )
             logits = self.apply_penalties(
                 logits, sampling_metadata, metadata, repeat_indices, output_token_ids

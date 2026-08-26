@@ -70,11 +70,20 @@ def _parse_gemma4_value(value_str: str) -> object:
     if value_str.lower() in ("null", "none", "nil"):
         return None
 
-    # Number (int or float)
+    # Number (int, float, or scientific notation).
+    # Order: int first (so `42` stays int, not 42.0). If that fails,
+    # try float — which also covers scientific notation (`1e-9`, `1E5`,
+    # `-1.5e-3`, `+2e10`) and signed bare floats (`-3.14`). The prior
+    # `"." in value_str` heuristic missed scientific-notation values that
+    # lack a decimal point, falling through to the bare-string branch
+    # below and producing `{"charge1": "1e-9"}` instead of
+    # `{"charge1": 1e-09}` once serialized by `json.dumps`.
     try:
-        if "." in value_str:
-            return float(value_str)
         return int(value_str)
+    except ValueError:
+        pass
+    try:
+        return float(value_str)
     except ValueError:
         pass
 
@@ -437,6 +446,31 @@ class Gemma4ToolParser(ToolParser):
     # Non-streaming extraction
     # ------------------------------------------------------------------
 
+    # Gemma4 requires ``skip_special_tokens=False`` (see line ~410) so the
+    # channel-aware reasoning parser and the ``<|tool_call>…<tool_call|>``
+    # tool parser can locate their respective spans. As a side-effect, any
+    # turn / tool-response / eos sentinels that appear after the parsed
+    # spans (or in plain-text completions) survive into the ``content``
+    # field and leak to the OpenAI-style chat-completion response unless
+    # we strip them here.
+    _TRAILING_SPECIAL_TOKENS = ("<turn|>", "<|tool_response>", "<eos>")
+
+    @classmethod
+    def _strip_trailing_special_tokens(cls, text: str | None) -> str | None:
+        """Remove residual Gemma4 special tokens from extracted content.
+
+        Returns ``None`` if stripping leaves only whitespace, so the caller
+        can hand ``None`` to ``ExtractedToolCallInformation.content`` to
+        indicate "no real text content" (matches the existing
+        ``content if content else None`` convention).
+        """
+        if not text:
+            return text
+        for tok in cls._TRAILING_SPECIAL_TOKENS:
+            text = text.replace(tok, "")
+        text = text.strip()
+        return text or None
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -444,14 +478,18 @@ class Gemma4ToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         if self.tool_call_start_token not in model_output:
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False,
+                tool_calls=[],
+                content=self._strip_trailing_special_tokens(model_output),
             )
 
         try:
             matches = self.tool_call_regex.findall(model_output)
             if not matches:
                 return ExtractedToolCallInformation(
-                    tools_called=False, tool_calls=[], content=model_output
+                    tools_called=False,
+                    tool_calls=[],
+                    content=self._strip_trailing_special_tokens(model_output),
                 )
 
             tool_calls: list[ToolCall] = []
@@ -474,13 +512,15 @@ class Gemma4ToolParser(ToolParser):
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
-                content=content if content else None,
+                content=self._strip_trailing_special_tokens(content),
             )
 
         except Exception:
             logger.exception("Error extracting tool calls from Gemma4 response")
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False,
+                tool_calls=[],
+                content=self._strip_trailing_special_tokens(model_output),
             )
 
     # ------------------------------------------------------------------

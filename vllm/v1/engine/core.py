@@ -521,7 +521,28 @@ class EngineCore:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
-                if not scheduler_output.pending_structured_output_tokens:
+                # Force the deferred-grammar path when this step has
+                # structured-output reqs AND the batch_queue is non-empty.
+                # The deferred path guarantees that the prior step's
+                # `update_from_output` (which solely owns matcher state
+                # advance) runs BEFORE this step's `get_grammar_bitmask`
+                # is built. Without this, async-scheduling pipelines this
+                # step's bitmask compute concurrent with the prior step's
+                # matcher advance → stale matcher state → corruption.
+                # CRITICAL: `bool(batch_queue)` empty-queue guard is
+                # load-bearing — cold-start grammar reqs MUST take the
+                # immediate-sample branch because there is no prior step
+                # to defer behind. Without the guard, the immediately-
+                # following `batch_queue.pop()` raises IndexError on first
+                # decode.
+                force_defer_for_grammar = (
+                    scheduler_output.has_structured_output_requests
+                    and bool(batch_queue)
+                )
+                if (
+                    not scheduler_output.pending_structured_output_tokens
+                    and not force_defer_for_grammar
+                ):
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
                     grammar_output = self.scheduler.get_grammar_bitmask(
@@ -580,13 +601,16 @@ class EngineCore:
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
                 draft_token_ids = self.model_executor.take_draft_token_ids()
-                assert draft_token_ids is not None
-                # Update the draft token ids in the scheduler output to
-                # filter out the invalid spec tokens, which will be padded
-                # with -1 and skipped by the grammar bitmask computation.
-                self.scheduler.update_draft_token_ids_in_output(
-                    draft_token_ids, deferred_scheduler_output
-                )
+                # None when the prior step skipped the async draft->CPU copy
+                # (no structured-output reqs that step) — e.g. the first
+                # grammar decode, whose prior step is a plain decode. Mirror
+                # the non-async path (L480-481): nothing to filter, proceed.
+                if draft_token_ids is not None:
+                    # Filter invalid spec tokens (padded with -1, skipped by
+                    # the grammar bitmask computation).
+                    self.scheduler.update_draft_token_ids_in_output(
+                        draft_token_ids, deferred_scheduler_output
+                    )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
             grammar_output = self.scheduler.get_grammar_bitmask(
@@ -1423,11 +1447,13 @@ class EngineCoreProc(EngineCore):
         arg_types = signature(method).parameters.values()
         assert len(args) <= len(arg_types)
         return tuple(
-            msgspec.convert(v, type=p.annotation)
-            if isclass(p.annotation)
-            and issubclass(p.annotation, msgspec.Struct)
-            and not isinstance(v, p.annotation)
-            else v
+            (
+                msgspec.convert(v, type=p.annotation)
+                if isclass(p.annotation)
+                and issubclass(p.annotation, msgspec.Struct)
+                and not isinstance(v, p.annotation)
+                else v
+            )
             for v, p in zip(args, arg_types)
         )
 

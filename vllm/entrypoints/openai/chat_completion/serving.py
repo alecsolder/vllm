@@ -6,6 +6,7 @@ import io
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
+from dataclasses import replace as dataclass_replace
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
 
@@ -69,10 +70,15 @@ from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import (
+    BeamSearchParams,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tool_parser
+from vllm.v1.structured_output.gemma_chat_grammar import generate_gemma4_chat_grammar
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -156,6 +162,26 @@ class OpenAIServingChat(OpenAIServing):
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
         self.use_harmony = self.model_config.hf_config.model_type == "gpt_oss"
+
+        # Gemma4 chat-completion tool-grammar injection. When the served model
+        # is a Gemma4 variant and a request carries `tools`, synthesize a Lark
+        # grammar from the tool definitions via
+        # `generate_gemma4_tool_grammar(...)` and pass it through
+        # `structured_outputs.grammar`. The user must launch vllm with
+        # `--structured-outputs-config '{"backend":"guidance",...}'` for the
+        # grammar to be honored by the engine. `allow_thinking` follows the
+        # server-wide `structured_outputs_config.enable_in_reasoning` flag.
+        arch_str = (self.model_config.architectures or [""])[0]
+        self._gemma4_tool_grammar_active = arch_str.startswith("Gemma4")
+        so_config = getattr(
+            getattr(engine_client, "vllm_config", None),
+            "structured_outputs_config",
+            None,
+        )
+        self._gemma4_allow_thinking = bool(
+            getattr(so_config, "enable_in_reasoning", False)
+        )
+
         self.tool_call_id_type = get_tool_call_id_type(self.model_config)
 
         # NOTE(woosuk): While OpenAI's chat completion API supports browsing
@@ -188,6 +214,95 @@ class OpenAIServingChat(OpenAIServing):
             .with_defaults(self.default_chat_template_kwargs)
             .chat_template_kwargs
         )
+
+    def _maybe_inject_gemma4_grammar(self, request: ChatCompletionRequest) -> None:
+        """Inject a unified Lark grammar onto ``request.structured_outputs``
+        for Gemma4 models.
+
+        Handles four overlapping use cases (any combo of):
+          * ``request.tools`` present + ``tool_choice != "none"`` —
+            auto-generate tool-call envelopes.
+          * ``request.structured_outputs.json`` supplied — wrap the
+            user's JSON schema into a ``schema_body`` branch.
+          * ``chat_template_kwargs.enable_thinking=True`` (per-request)
+            OR server-wide ``enable_in_reasoning`` — wrap the body in
+            an optional ``<|channel>...<channel|>`` reasoning prefix.
+          * Any other ``structured_outputs`` constraint (regex / choice /
+            direct grammar / structural_tag / json_object) — respected
+            verbatim; this method skips.
+
+        On match, ``generate_gemma4_chat_grammar`` produces the composed
+        Lark grammar and attaches it to ``request.structured_outputs``.
+        ``to_sampling_params`` then propagates it to
+        ``SamplingParams.structured_outputs``.
+        """
+        if not self._gemma4_tool_grammar_active:
+            return
+
+        has_tools = bool(request.tools) and request.tool_choice != "none"
+
+        # User-supplied structured_outputs?  We can only compose a JSON
+        # schema (other constraints are opaque to us); respect any other
+        # constraint verbatim by short-circuiting.
+        existing = request.structured_outputs
+        user_schema: str | dict[str, Any] | None = None
+        if existing is not None:
+            for field in (
+                "regex",
+                "choice",
+                "grammar",
+                "structural_tag",
+                "json_object",
+            ):
+                if getattr(existing, field) is not None:
+                    return
+            if existing.json is not None:
+                user_schema = existing.json
+
+        if not has_tools and user_schema is None:
+            return
+
+        # Thinking is allowed if EITHER the server-wide flag (engine
+        # config `enable_in_reasoning`) OR the per-request chat-template
+        # kwarg `enable_thinking` is set. The `?` quantifier on
+        # `thinking_block` keeps this safe even when the model doesn't
+        # actually emit reasoning.
+        kwargs = self._effective_chat_template_kwargs(request)
+        allow_thinking = self._gemma4_allow_thinking or bool(
+            kwargs.get("enable_thinking")
+        )
+
+        # Pydantic tool definitions become plain dictionaries for the grammar
+        # generator.
+        tool_dicts: list[dict[str, Any]] | None = None
+        if has_tools:
+            tool_dicts = [
+                tool.model_dump(exclude_none=True) for tool in (request.tools or [])
+            ]
+
+        grammar = generate_gemma4_chat_grammar(
+            tools=tool_dicts,
+            json_schema=user_schema,
+            allow_thinking=allow_thinking,
+            allow_natural_language=(request.tool_choice in (None, "auto", "none")),
+        )
+
+        if existing is None:
+            request.structured_outputs = StructuredOutputsParams(grammar=grammar)
+        else:
+            # Clear `json` if it was set (we just absorbed it into `grammar`).
+            request.structured_outputs = dataclass_replace(
+                existing, json=None, grammar=grammar
+            )
+
+        # Preserve `<tool_call|>` (token 49) in the response `content`.
+        # That token is registered as a stop token; with the default
+        # `include_stop_str_in_output=False` it gets stripped from
+        # `content` before the tool-call parser runs, so the parser cannot
+        # find the close marker. Force-set True for any request where we just
+        # injected a Gemma4 grammar; this is harmless for
+        # schema-only flows where the stop token is `<turn|>` or `<eos>`.
+        request.include_stop_str_in_output = True
 
     async def render_chat_request(
         self,
@@ -282,14 +397,21 @@ class OpenAIServingChat(OpenAIServing):
 
             max_tokens = get_max_tokens(
                 max_model_len,
-                request.max_completion_tokens
-                if request.max_completion_tokens is not None
-                else request.max_tokens,
+                (
+                    request.max_completion_tokens
+                    if request.max_completion_tokens is not None
+                    else request.max_tokens
+                ),
                 self._extract_prompt_len(engine_input),
                 self.default_sampling_params,
                 self.override_max_tokens,
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
+
+            # Mutate `request.structured_outputs` so the grammar flows
+            # through `to_sampling_params` normally. Idempotent across the
+            # multi-prompt loop (short-circuits if a grammar is already set).
+            self._maybe_inject_gemma4_grammar(request)
 
             sampling_params: SamplingParams | BeamSearchParams
             if request.use_beam_search:
@@ -347,11 +469,13 @@ class OpenAIServingChat(OpenAIServing):
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=reasoning_ended,
-                    reasoning_parser_kwargs={
-                        "chat_template_kwargs": chat_template_kwargs,
-                    }
-                    if reasoning_parser
-                    else None,
+                    reasoning_parser_kwargs=(
+                        {
+                            "chat_template_kwargs": chat_template_kwargs,
+                        }
+                        if reasoning_parser
+                        else None
+                    ),
                 )
 
             generators.append(generator)
@@ -1082,11 +1206,13 @@ class OpenAIServingChat(OpenAIServing):
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
-                finish_reason="tool_calls"
-                if is_finish_reason_tool_calls
-                else output.finish_reason
-                if output.finish_reason
-                else "stop",
+                finish_reason=(
+                    "tool_calls"
+                    if is_finish_reason_tool_calls
+                    else output.finish_reason
+                    if output.finish_reason
+                    else "stop"
+                ),
                 stop_reason=output.stop_reason,
                 token_ids=(
                     as_list(output.token_ids) if request.return_token_ids else None

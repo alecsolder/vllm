@@ -86,6 +86,8 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_GEMMA4_JUMP_MIN_BATCH_FRACTION: float = 0.5
+    VLLM_GEMMA4_JUMP_UNENFORCED: bool = False
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -600,6 +602,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Gemma4 jump-decoding (FF) per-step batch-fraction gate: take the
+    # FF/jump quick-step only when len(predictable_ff_writes)/num_reqs
+    # >= this fraction. 0.5 default preserves bs=1 / few-grammar-req
+    # latency wins (1/1 >= 0.5 still fires) while restoring MTP
+    # speculation for the batch when only a small fraction would FF (the
+    # high-batch throughput regime). PERF-ONLY: gating FF off drops those
+    # reqs to the MTP draft path; the grammar bitmask still forces the
+    # same tokens at verification -> identical output, accept-length-only
+    # effect. 0.0 (with the n_with_jumps>=1 guard) == the legacy
+    # "any req jumps" behavior (use as a plumbing/baseline check).
+    "VLLM_GEMMA4_JUMP_MIN_BATCH_FRACTION": lambda: float(
+        os.getenv("VLLM_GEMMA4_JUMP_MIN_BATCH_FRACTION", "0.5")
+    ),
+    # Gemma4 "unenforced jump": use the grammar ONLY to detect guaranteed-
+    # forced runs (jump them) -- NEVER build or apply a bitmask, so the model
+    # samples FREE everywhere else. On a grammar-invalid sampled token the req
+    # fails OPEN (grammar disabled for the rest of that req). Overrides the
+    # config field structured_outputs_config.jump_decoding_unenforced WHEN SET.
+    # Precondition: enable_jump_decoding=True + speculative K>0 (else no-op).
+    "VLLM_GEMMA4_JUMP_UNENFORCED": lambda: bool(
+        int(os.getenv("VLLM_GEMMA4_JUMP_UNENFORCED", "0"))
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton
@@ -1869,10 +1893,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DBO_COMM_SMS": lambda: int(
         os.getenv(
             "VLLM_DBO_COMM_SMS",
-            "64"
-            if hasattr(__import__("torch").version, "hip")
-            and __import__("torch").version.hip is not None
-            else "20",
+            (
+                "64"
+                if hasattr(__import__("torch").version, "hip")
+                and __import__("torch").version.hip is not None
+                else "20"
+            ),
         )
     ),
     # Enable max_autotune & coordinate_descent_tuning in inductor_config
