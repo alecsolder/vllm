@@ -19,9 +19,22 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        ktc = self.vllm_config.kv_transfer_config
+        is_kv_producer = ktc is not None and ktc.is_kv_producer
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
+                continue
+            # Skip placeholder increment on kv_producer (prefill) engines.
+            # Disagg-prefill design intentionally doesn't sample on the
+            # completing chunk — the decode engine produces the first
+            # decoded token after KV transfer. Without this skip,
+            # num_output_placeholders increments to 1 on the completing
+            # step, but parse_output returns [] for that step on the
+            # prefill role (no draft tokens scheduled), tripping the
+            # scheduler's async wedge guard. The guard recovers cleanly
+            # but adds latency and log noise on every completing chunk.
+            if is_kv_producer:
                 continue
 
             scheduler_output.pending_structured_output_tokens |= (

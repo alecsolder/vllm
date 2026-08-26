@@ -498,6 +498,16 @@ class InputBatch:
         if not spec_token_ids:
             return
 
+        # The scheduler's `update_draft_token_ids_in_output` may emit
+        # `-1` placeholders for grammar-rejected / padded draft slots
+        # (e.g. an all-rejected batch arrives as `[-1, -1, -1]`).
+        # Under async scheduling, `_prepare_input_ids` overwrites those
+        # placeholder positions before the GPU forward, so a `-1` in
+        # `token_ids_cpu` here does not leak into `input_ids.gpu`.
+        # Store `spec_token_ids` directly; the JD
+        # fabricate-broadcast path's `prev_sampled<0 → 0` clamp covers
+        # the GPU draft-buffer side.
+
         # For async scheduling, token_ids_cpu assigned from
         # spec_token_ids are placeholders and will be overwritten in
         # _prepare_input_ids.

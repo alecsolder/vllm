@@ -23,6 +23,17 @@ class SpecDecodeMetadata:
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
 
+    # FF-bypass signal: True iff the entire batch's draft tokens came from
+    # the jump-decoding quick-step write path (every req in the batch got
+    # K forced FF tokens; no req fell back to the regular drafter or to
+    # zero-fill). When True, `RejectionSampler.forward` can skip the
+    # target_logits softmax + argmax + rejection kernel + recovered_sample
+    # — the grammar bitmask precondition guarantees acceptance of every FF
+    # (non-FF logits = -inf after bitmask). Default False; staged by
+    # `gpu_model_runner`'s quick-step block onto the NEXT step's
+    # `SpecDecodeMetadata` via `self._next_step_all_ff_step`.
+    all_ff_step: bool = False
+
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
 

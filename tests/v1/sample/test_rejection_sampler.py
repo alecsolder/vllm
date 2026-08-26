@@ -305,6 +305,31 @@ def test_parametrized_cases(rejection_sampler, spec_tokens, output_tokens, expec
     assert torch.equal(output.sampled_token_ids, expected_tensor)
 
 
+def test_all_ff_step_fast_path_writes_forced_drafts(rejection_sampler):
+    """A fully forced step bypasses rejection and appends the bonus token."""
+    spec_tokens = [[10, 20, 30], [40, 50, 60]]
+    bonus_tokens = torch.tensor([[7], [8]], dtype=torch.int32, device=DEVICE_TYPE)
+    logits = create_logits_tensor([[99, 98, 97, 0], [96, 95, 94, 0]])
+    metadata = create_spec_decode_metadata(spec_tokens, logits)
+    metadata.all_ff_step = True
+
+    mock_sampler_output(rejection_sampler, bonus_tokens)
+    output = rejection_sampler(
+        metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=create_sampling_metadata(all_greedy=True),
+    )
+
+    expected = torch.tensor(
+        [[10, 20, 30, 7], [40, 50, 60, 8]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+    assert output.logprobs_tensors is None
+
+
 ########################### Tests for Random Sampling ###################
 @pytest.mark.parametrize("k", [1, 3, 5])
 @pytest.mark.parametrize("vocab_size", [1000])

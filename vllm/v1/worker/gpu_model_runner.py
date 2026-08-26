@@ -191,7 +191,6 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
-from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
@@ -201,6 +200,7 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
+from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -632,6 +632,20 @@ class GPUModelRunner(
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
 
+        # Worker that applies the structured-output (grammar) bitmask to the
+        # logits via the async-copy + Triton-kernel path. Created
+        # unconditionally: the apply site is gated on `grammar_output`, not on
+        # `speculative_config`, so grammar-without-spec-decode must still find
+        # this worker present.
+        self.structured_outputs_worker = StructuredOutputsWorker(
+            max_num_logits=self.max_num_reqs * (self.num_spec_tokens + 1),
+            # GPUModelRunner has no `self.vocab_size`; use model_config so the
+            # worker's bitmask buffer width matches what StructuredOutputManager
+            # sizes the bitmask to (it also uses model_config.get_vocab_size()).
+            vocab_size=self.model_config.get_vocab_size(),
+            device=self.device,
+        )
+
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
         # NOTE(rob): num_prompt_logprobs only includes reqs
@@ -831,6 +845,23 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        # JD CPU-origin draft mirror. Set by the jump-decoding quick-step's
+        # any_ff_step block iff the drafter dispatch is skipped; consumed
+        # by `_get_draft_token_ids_cpu` as a fast-path that bypasses the
+        # `draft_token_ids_event.synchronize()` blocking D2H. Stays `None`
+        # on non-JD steps and on JD steps that did not take the FF
+        # quick-step path.
+        self._draft_token_ids_jd_cpu: list[list[int]] | None = None
+        # JD FF-bypass staging: set by the quick-step in step N to signal
+        # to the NEXT step's `_calc_spec_decode_metadata` that the strict
+        # `all_ff_step` flag should be set on `SpecDecodeMetadata`. False
+        # on non-JD steps.
+        self._next_step_all_ff_step: bool = False
+        # Gemma4 JD per-step batch-fraction gate (perf-only, env-tunable).
+        # The FF/jump quick-step fires only when
+        # len(predictable_ff_writes)/num_reqs >= this. Read once here to
+        # avoid per-step env lookups. 0.0 == legacy "any FF req fires".
+        self._jump_min_batch_fraction: float = envs.VLLM_GEMMA4_JUMP_MIN_BATCH_FRACTION
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
@@ -868,6 +899,18 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # Dedicated D2H event for `num_accepted_tokens`.
+        # Lazy-initialized in `_update_states_after_model_execute` right
+        # after the `non_blocking=True` D2H copy and `record()`-ed on the
+        # current CUDA stream; subsequent reads of
+        # `input_batch.num_accepted_tokens_cpu` call `.synchronize()`
+        # first. The OSS `torch.Event` pattern recorded above with no
+        # explicit stream argument was missing this barrier under high
+        # concurrency, allowing stale CPU-side reads that desynced the
+        # rejection-sampler bookkeeping against the actual sampled
+        # tokens. Tracked separately from `num_accepted_tokens_event`
+        # so we don't disturb the existing event's lifecycle.
+        self.num_accepted_tokens_d2h_event: torch.cuda.Event | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
@@ -1458,7 +1501,30 @@ class GPUModelRunner(
                 _pinned_val_buf=self._ngram_pinned_val_buf,
             )
 
-        if deferred_spec_decode_corrections:
+        # Gate the CPU-side correction closure on workload types that
+        # actually need it. For batches that hit none of (mamba "align"
+        # cache, n-gram GPU drafting, MM encoder inputs scheduled this
+        # step), the closure's mutations to
+        # `req_state.num_computed_tokens` /
+        # `input_batch.num_computed_tokens_cpu` are dead weight: the
+        # next step's `_update_states` overwrites them with the
+        # scheduler's authoritative value (no consumer reads them in
+        # between). The GPU-side correction via
+        # `update_num_computed_tokens_for_batch_change` is authoritative
+        # for forward-pass position computation. Skip the closure
+        # (and the `valid_sampled_token_count_event.synchronize()`
+        # critical-path wait it forces) when none of those signals fire.
+        # The MM signal is per-batch (`scheduled_encoder_inputs`), not
+        # the model-level `supports_mm_inputs` flag — for MM-capable
+        # text-batch models (e.g. Gemma-4) the model flag is always
+        # True even on text-only batches that don't need the
+        # correction.
+        needs_cpu_correction = (
+            self.cache_config.mamba_cache_mode == "align"
+            or is_ngram_gpu
+            or bool(scheduler_output.scheduled_encoder_inputs)
+        )
+        if deferred_spec_decode_corrections and needs_cpu_correction:
 
             def correct_spec_decode_token_counts():
                 valid_sampled_token_count = self._get_valid_sampled_token_count()
@@ -1538,6 +1604,14 @@ class GPUModelRunner(
             )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
+            # Record completion of the non_blocking D2H on the current
+            # CUDA stream so step N+1's CPU read in `_prepare_inputs` can
+            # block on it. Without this barrier the CPU side races the
+            # copy under async scheduling + high concurrency, producing
+            # stale `num_accepted_tokens_cpu` reads.
+            if self.num_accepted_tokens_d2h_event is None:
+                self.num_accepted_tokens_d2h_event = torch.cuda.Event()
+            self.num_accepted_tokens_d2h_event.record(torch.cuda.current_stream())
 
             if self.cache_config.mamba_cache_mode == "all":
                 mamba_utils.postprocess_mamba_all(
@@ -2020,6 +2094,13 @@ class GPUModelRunner(
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
             self.num_accepted_tokens_event.synchronize()
+            # Belt-and-suspenders: also wait on the dedicated CUDA D2H
+            # event recorded in `_update_states_after_model_execute`.
+            # The `torch.Event` synchronize above SHOULD be sufficient
+            # but the explicit CUDA event closes any remaining race window
+            # under high concurrency.
+            if self.num_accepted_tokens_d2h_event is not None:
+                self.num_accepted_tokens_d2h_event.synchronize()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
@@ -2792,6 +2873,25 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
+        # One-shot consume of the FF-bypass staging flag. The quick-step
+        # in the prior step sets `self._next_step_all_ff_step` iff every
+        # req in THAT step's batch got K FFs (strict; mixed batches stay
+        # False). Read here passes the flag into THIS step's
+        # SpecDecodeMetadata; the subsequent reset ensures the flag
+        # doesn't leak into a later step where the quick-step didn't
+        # write FFs.
+        all_ff_step = self._next_step_all_ff_step
+        self._next_step_all_ff_step = False
+        # Defensive guard against batch composition changes between the
+        # FF-flag-setting step and this step: the rejection_sampler fast
+        # path reshapes `metadata.draft_token_ids` as `[batch_size, K]`,
+        # which requires every req in THIS step's batch to have exactly
+        # K drafts. The producer-side check can't catch a new prefill
+        # req joining this step (num_draft_tokens=0 for it), so we
+        # re-check against this step's `num_draft_tokens`.
+        if all_ff_step and not np.all(num_draft_tokens == self.num_spec_tokens):
+            all_ff_step = False
+
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2800,6 +2900,7 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            all_ff_step=all_ff_step,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -4198,9 +4299,11 @@ class GPUModelRunner(
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
-                else num_tokens_unpadded,
+                num_tokens_padded=(
+                    num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded
+                ),
                 num_reqs_padded=(
                     num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
                 ),
@@ -4405,10 +4508,29 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
+        # Apply structured output bitmasks if present. Under "unenforced jump"
+        # the scheduler builds no bitmask (grammar_bitmask is None), so this
+        # whole apply (fill + masked_fill + H2D) is skipped -> the model
+        # samples free; only the FF quick-step (below) writes forced tokens.
+        if grammar_output is not None and grammar_output.grammar_bitmask is not None:
+            # Build the cumulative per-request logit-count prefix the worker
+            # needs (the legacy InputBatch doesn't carry `cu_num_logits_np`):
+            # each request contributes 1 + (its scheduled spec-decode tokens)
+            # rows. Set it on the batch so the worker can read it.
+            sched_spec = scheduler_output.scheduled_spec_decode_tokens
+            nr = self.input_batch.num_reqs
+            per_req = np.array(
+                [1 + len(sched_spec.get(r, ())) for r in self.input_batch.req_ids[:nr]],
+                dtype=np.int32,
+            )
+            self.input_batch.cu_num_logits_np = np.concatenate(
+                ([0], np.cumsum(per_req, dtype=np.int32))
+            )
+            self.structured_outputs_worker.apply_grammar_bitmask(
+                logits,
+                self.input_batch,
+                grammar_output.structured_output_request_ids,
+                grammar_output.grammar_bitmask,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
@@ -4431,8 +4553,207 @@ class GPUModelRunner(
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_token_req_ids = None
+        self._draft_token_ids_jd_cpu = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
+        # Defensive reset of the FF-bypass staging flag. The JD block
+        # below sets it iff this step's drafts go entirely from FF writes.
+        # The reset here guards against a stale True leaking forward when
+        # an intervening step had no spec_decode_metadata to consume it.
+        self._next_step_all_ff_step = False
+
+        # ---------------- Jump-decoding (JD) quick-step block -----------
+        # Gated on `enable_jump_decoding` AND `speculative_config` set AND
+        # we have a `grammar_output` to work with. The matcher peek +
+        # CPU-side acceptance prediction now run in EngineCore
+        # (`Scheduler._compute_predictable_ff_writes`), so the unpicklable
+        # grammar matchers never cross the executor boundary under TP>1;
+        # the result arrives as the picklable
+        # `grammar_output.predictable_ff_writes` map. That prediction
+        # replaces the per-step blocking D2H of
+        # `sampler_output.sampled_token_ids`: for positions inside the FF
+        # prefix the bitmask is single-bit on the corresponding FF token,
+        # so the rejection sampler is deterministic and the accepted-token
+        # set is exactly computable CPU-side. The worker filters that map
+        # to the in-batch, non-discarded reqs and, when at least one has K
+        # forced tokens, fires the FF quick-step (skip the drafter dispatch
+        # below, write K FFs into the spec-decode draft buffer). Matchers
+        # are advanced only by the scheduler's `update_from_output` with
+        # the actually-sampled tokens — the FF write is optimistic and
+        # corrected next step.
+        any_ff_step = False
+        ff_req_count = 0
+        if (
+            self.vllm_config.structured_outputs_config.enable_jump_decoding
+            and self.speculative_config is not None
+            and grammar_output is not None
+        ):
+            K = self.num_spec_tokens
+            num_reqs = self.input_batch.num_reqs
+            # Re-derive the discard mask from the same source
+            # `_bookkeeping_sync` uses. The mask is set during forward
+            # and is not mutated between this site and `_bookkeeping_sync`.
+            discard_req_indices_set: set[int] = {
+                int(i) for i in np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
+            }
+
+            # Forced-token writes are computed in EngineCore (the scheduler
+            # process, where the grammar matchers live) and arrive as the
+            # picklable `{req_id: [K token ids]}` map on `grammar_output`
+            # (TP>1 safe). See `Scheduler._compute_predictable_ff_writes`.
+            #
+            # The worker applies only its runtime filter: a req absent from
+            # this step's batch, or flagged discard (still prefilling, not
+            # sampled this step), must NOT get an FF write — it falls back to
+            # the fabricated prev_sampled broadcast below. The FF token values
+            # themselves are batch-independent, so this filter is the sole
+            # worker-only data dependency.
+            predictable_ff_writes: list[tuple[str, list[int]]] = []
+            for req_id, ff_tokens in grammar_output.predictable_ff_writes.items():
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None or req_index in discard_req_indices_set:
+                    continue
+                predictable_ff_writes.append((req_id, list(ff_tokens[:K])))
+
+            # FF-priority quick-step. Fires whenever at least one
+            # grammar req has K post-advance FFs (predictable_ff_writes
+            # non-empty). Unpredictable reqs in a mixed batch get a
+            # prev_sampled broadcast placeholder; the accounting refresh
+            # at the tail of the block is what makes that placeholder
+            # safe under async scheduling (see the inline mechanism
+            # comment at the refresh site below).
+            #
+            # Per-step batch-fraction gate
+            # (VLLM_GEMMA4_JUMP_MIN_BATCH_FRACTION, perf-only): take the FF
+            # quick-step only when a large-enough fraction of the in-batch
+            # reqs have forced writes. Below the threshold FF is skipped --
+            # `any_ff_step` stays False and these reqs fall to the normal
+            # MTP draft path below, producing IDENTICAL output (the grammar
+            # bitmask still forces the same tokens at verification); only
+            # accept-length (speed) changes. The non-empty guard means
+            # fraction 0.0 reproduces the legacy "any req fires".
+            n_reqs_with_jumps = len(predictable_ff_writes)
+            ff_fraction = (n_reqs_with_jumps / num_reqs) if num_reqs else 0.0
+            run_ff_step = (
+                n_reqs_with_jumps > 0 and ff_fraction >= self._jump_min_batch_fraction
+            )
+            if run_ff_step:
+                # prev_sampled_token gather on GPU. Pure GPU op; no D2H.
+                last_idx = (
+                    (self.num_accepted_tokens.gpu[:num_reqs] - 1)
+                    .clamp(min=0)
+                    .unsqueeze(1)
+                )
+                self.input_batch.prev_sampled_token_ids = torch.gather(
+                    sampler_output.sampled_token_ids,
+                    dim=1,
+                    index=last_idx,
+                ).contiguous()
+
+                # Lazy-alloc `self._draft_token_ids` on GPU.
+                if self._draft_token_ids is None:
+                    self._draft_token_ids = torch.zeros(
+                        (len(self.input_batch.req_ids), K),
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+
+                # Fabricate drafts for ALL reqs first: broadcast each
+                # req's prev_sampled_token across its K draft slots.
+                # Real tokens preserve attention context. FF reqs get
+                # overwritten below.
+                #
+                # DEFEND against rejection sampler returning
+                # PLACEHOLDER_TOKEN_ID=-1 (e.g., NaN logits from fp8-KV
+                # overflow, or rejected/discarded draft positions).
+                # Without this guard, broadcasting -1 into
+                # `_draft_token_ids` would reach `vocab_parallel_embedding`
+                # via `input_ids.gpu` on the next step →
+                # `indexSelectSmallIndex` OOB → CUDA illegal memory
+                # access. Substituting 0 here is safe: the scheduler's
+                # async wedge guard rolls back the req's output
+                # regardless.
+                prev_sampled = self.input_batch.prev_sampled_token_ids[:num_reqs]
+                prev_sampled = torch.where(
+                    prev_sampled < 0,
+                    torch.zeros_like(prev_sampled),
+                    prev_sampled,
+                )
+                fabricated = prev_sampled.expand(-1, K).to(torch.int64)
+                assert isinstance(self._draft_token_ids, torch.Tensor)
+                self._draft_token_ids[:num_reqs, :K].copy_(fabricated)
+
+                # Batched FF overwrite. Pack FFs + row indices into pinned
+                # CPU staging tensors, single async H2D each, one
+                # `index_copy_` on GPU.
+                ff_req_indices = [
+                    self.input_batch.req_id_to_index[rid]
+                    for rid, _ in predictable_ff_writes
+                ]
+                flat_ff_tokens: list[int] = [
+                    tok
+                    for _, ff_tokens in predictable_ff_writes
+                    for tok in ff_tokens[:K]
+                ]
+                ff_tokens_cpu = torch.tensor(
+                    flat_ff_tokens,
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+                ff_tokens_gpu = ff_tokens_cpu.to(self.device, non_blocking=True).view(
+                    len(ff_req_indices), K
+                )
+                ff_indices_cpu = torch.tensor(
+                    ff_req_indices,
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+                ff_indices_gpu = ff_indices_cpu.to(self.device, non_blocking=True)
+                # Single-kernel `index_copy_`.
+                self._draft_token_ids.index_copy_(0, ff_indices_gpu, ff_tokens_gpu)
+                any_ff_step = True
+                ff_req_count = len(predictable_ff_writes)
+
+                # Refresh valid_sampled_token_count_{cpu,gpu,event} +
+                # input_batch.prev_sampled_token_ids without a drafter
+                # forward pass — same Triton kernel the drafter uses
+                # (prepare_next_token_ids_padded →
+                # _copy_valid_sampled_token_count). Required: the next
+                # step's correct_spec_decode_token_counts and
+                # _prepare_inputs read these; staleness produces wrong
+                # num_computed_tokens and JD mixed-batch async corruption.
+                next_token_ids, valid_sampled_tokens_count = (
+                    self.drafter.prepare_next_token_ids_padded(
+                        sampler_output.sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_mask.gpu,
+                    )
+                )
+                self._copy_valid_sampled_token_count(
+                    next_token_ids, valid_sampled_tokens_count
+                )
+
+            # FF-bypass signal for the NEXT step's rejection sampler fast
+            # path. Strict: True only when 100% of reqs got real K FFs.
+            self._next_step_all_ff_step = (
+                any_ff_step and ff_req_count == self.input_batch.num_reqs
+            )
+
+            if any_ff_step:
+                # Build a CPU-side draft mirror directly from CPU-origin
+                # FFs. The GPU tensor was written above for the rejection
+                # sampler; the CPU mirror lets `_get_draft_token_ids_cpu`
+                # skip the blocking D2H. Non-FF reqs in a mixed batch
+                # get `[]` (scheduler pads to K with -1 downstream).
+                num_reqs_local = self.input_batch.num_reqs
+                cpu_drafts: list[list[int]] = [[] for _ in range(num_reqs_local)]
+                for ff_req_id, ff_tokens in predictable_ff_writes:
+                    ff_idx = self.input_batch.req_id_to_index[ff_req_id]
+                    cpu_drafts[ff_idx] = list(ff_tokens)
+                self._draft_token_ids_jd_cpu = cpu_drafts
+                self._draft_token_req_ids = self.input_batch.req_ids.copy()
+        # ---------------- end JD block ----------------------------------
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -4452,7 +4773,9 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        # JD: when any_ff_step is True we wrote FFs into `_draft_token_ids`
+        # above; skip the drafter dispatch entirely.
+        if (not any_ff_step) and spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
                 spec_decode_common_attn_metadata
@@ -4520,9 +4843,15 @@ class GPUModelRunner(
                 # For Nemotron-H: it is necessary to zero out the draft tokens,
                 # otherwise the stale tokens will corrupt Mamba recurrent
                 # state and logprobs for sequences near max_model_len.
-                self._draft_token_ids = torch.zeros(
-                    1, device=self.device, dtype=torch.int32
-                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                # `torch.zeros` already gives 0s; `clamp_min(0)` is a no-op
+                # but keeps the invariant explicit alongside the other
+                # defense-in-depth clamps on this draft-buffer path
+                # (parallel-drafting / zero-fill / lazy-alloc).
+                self._draft_token_ids = (
+                    torch.zeros(1, device=self.device, dtype=torch.int32)
+                    .expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                    .clamp_min(0)
+                )
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
@@ -4570,9 +4899,9 @@ class GPUModelRunner(
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_connector_output
-                if self.supports_mm_inputs
-                else None,
+                ec_connector_output=(
+                    ec_connector_output if self.supports_mm_inputs else None
+                ),
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
@@ -4726,6 +5055,14 @@ class GPUModelRunner(
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
             return self._draft_token_ids, self.input_batch.req_ids
+        # JD fast-path: when the quick-step took the FF-priority branch
+        # it produced a CPU-side draft mirror directly from the CPU-origin
+        # forced-token writes (`grammar_output.predictable_ff_writes`,
+        # computed in EngineCore). Read that instead of synchronizing on
+        # the (skipped) GPU→CPU draft copy.
+        if self._draft_token_ids_jd_cpu is not None:
+            req_ids = self._draft_token_req_ids or self.input_batch.req_ids
+            return self._draft_token_ids_jd_cpu, req_ids
         req_ids = self._draft_token_req_ids
         if req_ids is None:
             return [], []
@@ -6787,12 +7124,16 @@ class GPUModelRunner(
                 attn_group.create_metadata_builders(
                     self.vllm_config,
                     self.device,
-                    kernel_block_sizes[kv_cache_group_id]
-                    if kv_cache_group_id < len(kernel_block_sizes)
-                    else None,
-                    num_metadata_builders=1
-                    if not self.parallel_config.use_ubatching
-                    else self.parallel_config.num_ubatches,
+                    (
+                        kernel_block_sizes[kv_cache_group_id]
+                        if kv_cache_group_id < len(kernel_block_sizes)
+                        else None
+                    ),
+                    num_metadata_builders=(
+                        1
+                        if not self.parallel_config.use_ubatching
+                        else self.parallel_config.num_ubatches
+                    ),
                 )
         # Calculate reorder batch threshold (if needed)
         # Note (tdoublep): do this *after* constructing builders,

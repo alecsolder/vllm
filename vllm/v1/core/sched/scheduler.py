@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -57,6 +59,10 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output.backend_guidance import (
+    GuidanceGrammar,
+    get_ll_executor,
+)
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
@@ -224,6 +230,24 @@ class Scheduler(SchedulerInterface):
                 # decoding instead of standard next-token sampling, so it has a query
                 # for the last sampled token plus queries for each draft token.
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
+
+        # Gemma4 "unenforced jump" (perf): detect/jump forced runs but NEVER
+        # build/apply a bitmask; on a grammar-invalid sampled token, fail open
+        # (disable grammar for that req + count). The env var overrides the
+        # config field WHEN SET. Baked precondition: only active with jump
+        # decoding + an active speculative config (else a no-op). Cached here to
+        # avoid per-step env/config reads (mirror the worker cache).
+        _uj_cfg = (
+            envs.VLLM_GEMMA4_JUMP_UNENFORCED
+            if "VLLM_GEMMA4_JUMP_UNENFORCED" in os.environ
+            else vllm_config.structured_outputs_config.jump_decoding_unenforced
+        )
+        self._jump_unenforced: bool = bool(
+            _uj_cfg
+            and vllm_config.structured_outputs_config.enable_jump_decoding
+            and speculative_config is not None
+            and self.num_spec_tokens > 0
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -1335,17 +1359,148 @@ class Scheduler(SchedulerInterface):
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
             if (req := self.requests.get(req_id))
-            and (req.use_structured_output and not req.is_prefill_chunk)
+            and req.use_structured_output
+            and not req.is_prefill_chunk
+            # Unenforced-jump fail-open: a diverged req has grammar disabled
+            # for the rest of generation -> exclude it (no bitmask, no FF).
+            and not (
+                req.structured_output_request is not None
+                and req.structured_output_request.disabled
+            )
         ]
         if not structured_output_request_ids:
             return None
 
-        bitmask = self.structured_output_manager.grammar_bitmask(
-            self.requests,
-            structured_output_request_ids,
-            scheduler_output.scheduled_spec_decode_tokens,
+        if self._jump_unenforced:
+            # Unenforced jump: detect/jump forced runs but NEVER build a
+            # bitmask (no fill_bitmask). Downstream _fill_bitmasks /
+            # unsafe_compute_mask_ptr* never run; the worker apply is guarded
+            # on `grammar_bitmask is not None`. FF compute below is independent
+            # of the bitmask (separate compute_ff_tokens_par round-trip).
+            bitmask = None
+        else:
+            bitmask = self.structured_output_manager.grammar_bitmask(
+                self.requests,
+                structured_output_request_ids,
+                scheduler_output.scheduled_spec_decode_tokens,
+            )
+        # Compute jump-decoding forced-token writes here in EngineCore, where
+        # the (unpicklable) grammar matchers live, so only the picklable
+        # `predictable_ff_writes` map crosses the executor boundary (TP>1
+        # safe). Pure function of matcher state + scheduled drafts; the worker
+        # re-applies its discard/batch filter and owns the firing decision.
+        predictable_ff_writes = self._compute_predictable_ff_writes(
+            scheduler_output, structured_output_request_ids
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        return GrammarOutput(
+            structured_output_request_ids, bitmask, predictable_ff_writes
+        )
+
+    def _compute_predictable_ff_writes(
+        self,
+        scheduler_output: SchedulerOutput,
+        structured_output_request_ids: list[str],
+    ) -> dict[str, list[int]]:
+        """Compute per-request jump-decoding forced-token writes.
+
+        Runs in the EngineCore/scheduler process (where ``GuidanceGrammar``
+        matchers live) so the result — a picklable ``{req_id: [K token ids]}``
+        map — is all that needs to cross the executor boundary under TP>1.
+
+        For each scheduled guidance-backed request this peeks the next forced
+        tokens (one batched ``compute_ff_tokens_par`` Rust round-trip) and runs
+        the CPU-side acceptance prediction against the scheduled draft tokens.
+        A request is included only when it has at least ``K`` *post-advance*
+        forced tokens (i.e. forced tokens remaining after the predicted
+        accept), in which case the value is exactly those ``K`` token ids.
+
+        This is a peek only — matchers are NOT advanced here; the scheduler's
+        ``update_from_output`` advances them with the actually-sampled tokens.
+        The computation carries no worker-only data dependency (no discard
+        mask, no sampler output): for positions inside the forced-token prefix
+        the grammar bitmask is single-bit, so the accepted-token set is exactly
+        determined by (forced tokens, scheduled drafts). The worker applies the
+        discard/batch-presence filter when it stages the GPU write.
+        """
+        # Gate: JD enabled + an active speculative config (K > 0).
+        if (
+            not self.vllm_config.structured_outputs_config.enable_jump_decoding
+            or self.vllm_config.speculative_config is None
+            or self.num_spec_tokens <= 0
+        ):
+            return {}
+
+        K = self.num_spec_tokens
+
+        # Collect eligible guidance matchers (skip None/stopped). The same
+        # filter gates both the batched FF compute and the prediction loop,
+        # so the parallel lists line up by construction.
+        ff_compute_req_ids: list[str] = []
+        ff_compute_matchers: list[Any] = []
+        matchers_by_req: dict[str, GuidanceGrammar] = {}
+        for req_id in structured_output_request_ids:
+            req = self.requests.get(req_id)
+            if req is None or req.structured_output_request is None:
+                continue
+            # Unenforced-jump fail-open: skip diverged (grammar-disabled) reqs
+            # (defensive; structured_output_request_ids already excludes them).
+            if req.structured_output_request.disabled:
+                continue
+            grammar = req.structured_output_request.grammar
+            if not isinstance(grammar, GuidanceGrammar):
+                continue
+            if grammar.is_stopped():
+                continue
+            ff_compute_req_ids.append(req_id)
+            ff_compute_matchers.append(grammar.ll_matcher)
+            matchers_by_req[req_id] = grammar
+
+        if not ff_compute_matchers:
+            return {}
+
+        # Batched pre-advance FF compute: one `compute_ff_tokens_par` Rust
+        # round-trip (rayon par_iter, GIL released) over all eligible matchers.
+        ff_results = get_ll_executor().compute_ff_tokens_par(ff_compute_matchers)
+        ff_tokens_by_req = dict(zip(ff_compute_req_ids, ff_results))
+
+        # CPU-side acceptance prediction. Decision table:
+        #   K_e = len(drafts) for this req; N = len(ffs)
+        #   d   = first divergence in [0, min(K_e, N)); = min if none.
+        #   Case 1 (d < min(K_e, N)):     consumed = d + 1
+        #   Case 2 (no divergence, N >= K_e + 1):  consumed = K_e + 1
+        #   Boundary A (no divergence, N == K_e):  bonus unpredictable.
+        #   Boundary B (no divergence, N <  K_e):  mid-pos multi-bit, unpred.
+        #   Boundary C (N == 0): no FFs at all, unpredictable.
+        # A req is emitted only when it has >= K forced tokens left after the
+        # predicted accept; the value is those K token ids.
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
+        predictable_ff_writes: dict[str, list[int]] = {}
+        for req_id in ff_compute_req_ids:
+            ffs = ff_tokens_by_req[req_id]
+            n_ffs = len(ffs)
+            if n_ffs == 0:
+                # Boundary C.
+                continue
+            drafts = scheduled_spec.get(req_id, ())
+            k_eff = len(drafts)
+            cap = min(k_eff, n_ffs)
+            divergence = cap
+            for i in range(cap):
+                if drafts[i] != ffs[i]:
+                    divergence = i
+                    break
+            if divergence < cap:
+                # Case 1.
+                consumed = divergence + 1
+            elif n_ffs >= k_eff + 1:
+                # Case 2.
+                consumed = k_eff + 1
+            else:
+                # Boundary A or B.
+                continue
+            if n_ffs - consumed >= K:
+                predictable_ff_writes[req_id] = list(ffs[consumed : consumed + K])
+        return predictable_ff_writes
 
     def update_from_output(
         self,
@@ -1480,22 +1635,88 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
+            # Matcher single source of truth: scheduler always advances
+            # grammar matchers with the ACTUAL sampled tokens here in
+            # `update_from_output`. The worker does NOT advance (see
+            # gpu_model_runner.py JD quick-step block).
+            advance_grammar = bool(new_token_ids)
+            if advance_grammar and self.structured_output_manager.should_advance(
+                request
+            ):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
                 if not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
                     req_id, new_token_ids
                 ):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. "
-                        "Terminating request.",
-                        new_token_ids,
-                        req_id,
-                    )
-                    request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False
-                    stopped = True
+                    if self._jump_unenforced:
+                        # Unenforced-jump fail-open: a free (unmasked) sampled
+                        # token diverged from the grammar. Do NOT strip it (the
+                        # free token must stand); instead disable grammar for the
+                        # rest of this request. The req then generates fully
+                        # free (no FF, no advance, no mask)
+                        # — see should_advance / get_grammar_bitmask disabled
+                        # guards.
+                        logger.warning(
+                            "Grammar divergence for request %s under unenforced "
+                            "jump; disabling grammar for the remainder.",
+                            req_id,
+                        )
+                        struct_output_request.disabled = True
+                    else:
+                        # Post-reject prefix recovery via `validate_tokens`.
+                        # `accept_tokens` failed; trim the tail of new_token_ids
+                        # that the matcher could not accept. `validate_tokens`
+                        # returns the length of the longest prefix of
+                        # `new_token_ids` the matcher would accept from its
+                        # current state — all tokens beyond that prefix are
+                        # post-stop garbage that must not escape to the user.
+                        # The tokens were already appended via
+                        # `_update_request_with_output` at the top of this
+                        # iteration, so we remove the tail from the
+                        # request's output lists. `num_output_tokens` /
+                        # `num_tokens` are properties over these lists — no
+                        # separate counter needs adjusting.
+                        logger.warning(
+                            "Grammar rejected tokens for request %s; "
+                            "attempting prefix recovery via validate_tokens.",
+                            req_id,
+                        )
+                        accepted_prefix = struct_output_request.grammar.validate_tokens(
+                            list(new_token_ids)
+                        )
+                        accepted_prefix_len = len(accepted_prefix)
+                        if accepted_prefix_len < len(new_token_ids):
+                            n_strip = len(new_token_ids) - accepted_prefix_len
+                            del request._output_token_ids[-n_strip:]
+                            del request._all_token_ids[-n_strip:]
+                            new_token_ids = new_token_ids[:accepted_prefix_len]
+
+            # Grammar-stop detection: detect matcher reaching stop state
+            # (e.g. grammar terminated via a closing brace without emitting
+            # tokenizer EOS). Without this check the async pipeline keeps
+            # scheduling the request and accumulates garbage post-stop
+            # tokens. Mirrors the `if stopped:` finish-handling block above.
+            # Guarded on `not request.is_finished()` so it's a no-op when
+            # the earlier stop-handling already ran (sampling-side stop /
+            # max-tokens / pooler).
+            if (
+                not request.is_finished()
+                and request.structured_output_request is not None
+                # Unenforced-jump fail-open: a diverged req ignores grammar for
+                # the rest of generation -> don't let stale matcher stop-state
+                # finish it.
+                and not request.structured_output_request.disabled
+                and request.structured_output_request.grammar is not None
+                and getattr(
+                    request.structured_output_request.grammar,
+                    "is_stopped",
+                    None,
+                )
+                and request.structured_output_request.grammar.is_stopped()
+            ):
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
 
             routed_experts = None
             if (

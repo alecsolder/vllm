@@ -40,6 +40,24 @@ class StructuredOutputsConfig:
     loaded and registered."""
     enable_in_reasoning: bool = False
     """Whether to use structured input for reasoning."""
+    enable_jump_decoding: bool = False
+    """If `True`, the worker routes grammar-forced tokens (FFs) through the
+    spec-decode draft buffer: when the grammar matcher has at least K forced
+    tokens ready, they are written into `_draft_token_ids` in place of the
+    drafter's output for that step (a "quick step" — the drafter forward is
+    skipped). The rejection sampler accepts FFs automatically because the
+    bitmask at each FF position is singleton. Only supported with the
+    `guidance` / `cached_guidance` backend AND speculative decoding enabled."""
+    jump_decoding_unenforced: bool = False
+    """If `True`, "unenforced jump": the grammar is used ONLY to detect
+    guaranteed-forced token runs (which are jumped via jump-decoding) and NO
+    bitmask is ever built or applied -- the model samples freely at every
+    non-forced position. On a grammar-invalid sampled token the request fails
+    OPEN: grammar is disabled for the remainder of that request. This trades
+    grammar enforcement for throughput (drops the per-step bitmask build+apply).
+    Requires `enable_jump_decoding=True` AND speculative decoding enabled (else
+    it is a no-op). The env var `VLLM_GEMMA4_JUMP_UNENFORCED` overrides this
+    field when set."""
 
     def compute_hash(self) -> str:
         """
