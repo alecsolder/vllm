@@ -14,6 +14,11 @@ Easy, fast, and cheap LLM serving for everyone
 | <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
 </p>
 
+> [!NOTE]
+> **Research prototype:** This branch demonstrates Gemma 4 grammar jump
+> decoding. See [the demo overview](DEMO_JUMP_DECODING.md) for the design,
+> measured results, and limitations.
+
 🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
 For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
