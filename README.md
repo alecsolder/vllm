@@ -1,4 +1,10 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+> [!NOTE]
+> This branch showcases an experimental DiffusionGemma constrained-decoding
+> prototype. See [DEMO_DIFFUSION_CONSTRAINTS.md](DEMO_DIFFUSION_CONSTRAINTS.md)
+> for the design, measured results, and limitations.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">

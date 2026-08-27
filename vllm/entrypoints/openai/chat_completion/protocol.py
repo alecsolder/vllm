@@ -470,6 +470,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     _grammar_from_tool_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by ``ToolParser.adjust_request``."""
 
+    _diffusion_toolcall_grammar: str | None = PrivateAttr(default=None)
+    """Gemma4 tool-call grammar consumed by DiffusionGemma's worker-side
+    constrained decoder. Set only by ``Gemma4ToolParser.adjust_request``."""
+
     def build_chat_params(
         self,
         default_template: str | None,
@@ -614,6 +618,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self._diffusion_toolcall_grammar is not None:
+            # The diffusion sampler operates worker-side, so carry its grammar
+            # without entering the scheduler's autoregressive FSM path.
+            extra_args["diffusion_toolcall_grammar"] = self._diffusion_toolcall_grammar
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
