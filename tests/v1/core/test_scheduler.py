@@ -680,6 +680,80 @@ def test_no_mm_input_chunking():
         )
 
 
+@pytest.mark.parametrize("num_computed_tokens", [0, 3, 5])
+@pytest.mark.parametrize("encoder_cached", [False, True])
+@pytest.mark.parametrize("disable_chunked_mm_input", [False, True])
+def test_no_mm_input_chunking_respects_cached_inputs_and_prefixes(
+    num_computed_tokens, encoder_cached, disable_chunked_mm_input
+):
+    """An image suffix must fit even when its embeddings or KV prefix are cached."""
+    scheduler = object.__new__(Scheduler)
+    scheduler.is_encoder_decoder = False
+    scheduler.scheduler_config = SimpleNamespace(
+        disable_chunked_mm_input=disable_chunked_mm_input
+    )
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=8)
+    scheduler.ec_connector = None
+    (request,) = create_requests(
+        1, num_tokens=11, mm_positions=[[PlaceholderRange(offset=3, length=8)]]
+    )
+    if encoder_cached:
+        scheduler.encoder_cache_manager.allocate(request, 0)
+
+    encoder_inputs, num_tokens, budget, external = (
+        scheduler._try_schedule_encoder_inputs(
+            request, num_computed_tokens, 7 - num_computed_tokens, 8
+        )
+    )
+    if disable_chunked_mm_input:
+        assert num_tokens == max(0, 3 - num_computed_tokens)
+        assert encoder_inputs == []
+        assert budget == 8
+    else:
+        assert num_tokens == 7 - num_computed_tokens
+        assert encoder_inputs == ([] if encoder_cached else [0])
+        assert budget == (8 if encoder_cached else 0)
+    assert external == []
+
+    # The same cached prefix makes progress when the complete suffix fits.
+    encoder_inputs, num_tokens, _, _ = scheduler._try_schedule_encoder_inputs(
+        request, num_computed_tokens, 11 - num_computed_tokens, 8
+    )
+    assert num_tokens == 11 - num_computed_tokens
+    assert encoder_inputs == ([] if encoder_cached else [0])
+
+
+@pytest.mark.parametrize("disable_chunked_mm_input", [False, True])
+def test_no_mm_input_chunking_applies_to_repeated_image_occurrences(
+    disable_chunked_mm_input,
+):
+    """Reusing one encoder result must not split its second decoder occurrence."""
+    scheduler = object.__new__(Scheduler)
+    scheduler.is_encoder_decoder = False
+    scheduler.scheduler_config = SimpleNamespace(
+        disable_chunked_mm_input=disable_chunked_mm_input
+    )
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=4)
+    scheduler.ec_connector = None
+    (request,) = create_requests(
+        1,
+        num_tokens=12,
+        mm_hashes_list=[["shared", "shared"]],
+        mm_positions=[
+            [PlaceholderRange(offset=0, length=4), PlaceholderRange(offset=8, length=4)]
+        ],
+    )
+
+    encoder_inputs, num_tokens, budget, external = (
+        scheduler._try_schedule_encoder_inputs(request, 0, 10, 4)
+    )
+
+    assert num_tokens == (8 if disable_chunked_mm_input else 10)
+    assert encoder_inputs == [0]
+    assert budget == 0
+    assert external == []
+
+
 @pytest.mark.parametrize("enable_prefix_caching", [True, False])
 def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     """Test scheduling behavior with concurrent partial requests.
@@ -6718,3 +6792,196 @@ def test_update_draft_token_ids_in_output_strips_padding():
         -1,
     ]
     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
+
+
+@pytest.mark.parametrize(
+    "enabled,read_only", [(True, True), (False, True), (True, False)]
+)
+@pytest.mark.parametrize("warm", [True, False])
+def test_read_prefix_memo_preserves_per_child_cache_refs_and_stats(
+    monkeypatch,
+    enabled,
+    read_only,
+    warm,
+):
+    """Identical siblings retain separate references and admission accounting."""
+    monkeypatch.setenv("VLLM_DIFFUSION_MEMO_READ_PREFIX", "1" if enabled else "0")
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=32)
+    manager = scheduler.kv_cache_manager
+    if warm:
+        filler = create_requests(1, num_tokens=96, block_size=32, req_ids=["fill"])[0]
+        assert manager.allocate_slots(filler, 96) is not None
+        manager.free(filler)
+    requests = create_requests(3, num_tokens=100, block_size=32, same_prompt=True)
+    for request in requests:
+        if read_only:
+            request.sampling_params.extra_args = {"diffusion_read_only": True}
+        scheduler.add_request(request)
+    lookup = Mock(wraps=manager.get_computed_blocks)
+    monkeypatch.setattr(manager, "get_computed_blocks", lookup)
+    output = scheduler.schedule()
+    expected_hits = [96, 96, 96] if warm else [0, 96, 96]
+    assert [r.num_computed_tokens for r in output.scheduled_new_reqs] == expected_hits
+    assert output.num_scheduled_tokens == {
+        r.request_id: 100 - hit for r, hit in zip(requests, expected_hits)
+    }
+    prefix_blocks = manager.get_blocks(requests[0].request_id).blocks[0][:3]
+    for request in requests[1:]:
+        assert manager.get_blocks(request.request_id).blocks[0][:3] == prefix_blocks
+    assert all(block.ref_cnt == 3 for block in prefix_blocks)
+    expected_lookups = (1 if warm else 2) if enabled and read_only else 3
+    assert lookup.call_count == expected_lookups
+    stats = manager.prefix_cache_stats
+    assert stats.requests == 3
+    assert stats.queries == 300
+    assert stats.hits == sum(expected_hits)
+    for request in requests:
+        manager.free(request)
+    assert all(block.ref_cnt == 0 for block in prefix_blocks)
+
+
+@pytest.mark.parametrize("invalidate", ["free", "evict", "reuse"])
+def test_read_prefix_memo_rechecks_block_liveness(monkeypatch, invalidate):
+    """A saved maximal hit cannot bypass cache eviction or block reuse."""
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=32)
+    manager = scheduler.kv_cache_manager
+    owner, child = create_requests(2, num_tokens=100, block_size=32, same_prompt=True)
+    for request in (owner, child):
+        request.sampling_params.extra_args = {"diffusion_read_only": True}
+    assert manager.allocate_slots(owner, 100) is not None
+    memo: dict = {}
+    cached = scheduler._get_local_prefix_cache_hit(child, memo)
+    assert cached[1] == 96
+    block_ids = {b.block_id for b in cached[0].blocks[0]}
+    if invalidate == "evict":
+        manager.evict_blocks(block_ids)
+    else:
+        manager.free(owner)
+        if invalidate == "reuse":
+            manager.block_pool.get_new_blocks(manager.block_pool.get_num_free_blocks())
+    lookup = Mock(wraps=manager.get_computed_blocks)
+    monkeypatch.setattr(manager, "get_computed_blocks", lookup)
+    actual = scheduler._get_local_prefix_cache_hit(child, memo)
+    assert lookup.call_count == 1
+    assert actual[1] == (96 if invalidate == "free" else 0)
+
+
+@pytest.mark.parametrize("variation", ["salt", "mm", "lora", "skip", "ordinary"])
+def test_read_prefix_memo_does_not_cross_request_cache_contract(monkeypatch, variation):
+    """Different salt and unsupported request types always use normal APC lookup."""
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=32)
+    manager = scheduler.kv_cache_manager
+    owner, child = create_requests(2, num_tokens=100, block_size=32, same_prompt=True)
+    for request in (owner, child):
+        request.sampling_params.extra_args = {"diffusion_read_only": True}
+    assert manager.allocate_slots(owner, 100) is not None
+    memo: dict = {}
+    scheduler._get_local_prefix_cache_hit(child, memo)
+    if variation == "salt":
+        child.cache_salt = "different-salt"
+        child.block_hashes.clear()
+        child.update_block_hashes()
+    elif variation == "mm":
+        child.mm_features = [object()]
+    elif variation == "lora":
+        child.lora_request = object()
+    elif variation == "skip":
+        child.skip_reading_prefix_cache = True
+    else:
+        child.sampling_params.extra_args = {}
+    lookup = Mock(wraps=manager.get_computed_blocks)
+    monkeypatch.setattr(manager, "get_computed_blocks", lookup)
+    result = scheduler._get_local_prefix_cache_hit(child, memo)
+    assert lookup.call_count == 1
+    assert result[1] == (0 if variation in ("salt", "skip") else 96)
+
+
+def test_read_prefix_memo_hybrid_null_blocks_and_prompt_cap(monkeypatch):
+    """Six-group SWA/global reuse preserves null padding and the last-token cap."""
+    from tests.v1.core.test_prefix_caching import make_kv_cache_manager
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    monkeypatch.setenv("VLLM_DIFFUSION_MEMO_READ_PREFIX", "1")
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=32)
+    config = KVCacheConfig(
+        num_blocks=4096,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"sliding{i}"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=1024,
+                ),
+            )
+            for i in range(5)
+        ]
+        + [
+            KVCacheGroupSpec(
+                ["global"],
+                FullAttentionSpec(
+                    block_size=32,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=2048,
+        hash_block_size=16,
+        log_stats=True,
+    )
+    scheduler.kv_cache_config = config
+    scheduler.kv_cache_manager = manager
+    owner = create_requests(1, num_tokens=2048, block_size=16, req_ids=["owner"])[0]
+    assert manager.allocate_slots(owner, 2016) is not None
+    manager.free(owner)
+    requests = create_requests(3, num_tokens=2048, block_size=16, same_prompt=True)
+    for request in requests:
+        request.sampling_params.extra_args = {"diffusion_read_only": True}
+        scheduler.add_request(request)
+    lookup = Mock(wraps=manager.get_computed_blocks)
+    monkeypatch.setattr(manager, "get_computed_blocks", lookup)
+    output = scheduler.schedule()
+    assert [r.num_computed_tokens for r in output.scheduled_new_reqs] == [2016] * 3
+    assert lookup.call_count == 1
+    for group in range(6):
+        count = 126 if group < 5 else 63
+        prefix = manager.get_blocks(requests[0].request_id).blocks[group][:count]
+        for request in requests[1:]:
+            assert (
+                manager.get_blocks(request.request_id).blocks[group][:count] == prefix
+            )
+        assert all(block.is_null or block.ref_cnt == 3 for block in prefix)
+        if group < 5:
+            assert any(block.is_null for block in prefix)
+
+
+@pytest.mark.parametrize("requests_count,events", [(1, False), (3, True)])
+def test_read_prefix_memo_scope_skips_singletons_and_cache_events(
+    monkeypatch,
+    requests_count,
+    events,
+):
+    """The waiting pass bypasses memoization when no benefit or event side effects."""
+    monkeypatch.setenv("VLLM_DIFFUSION_MEMO_READ_PREFIX", "1")
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=32)
+    manager = scheduler.kv_cache_manager
+    manager.enable_kv_cache_events = events
+    requests = create_requests(
+        requests_count, num_tokens=100, block_size=32, same_prompt=True
+    )
+    for request in requests:
+        request.sampling_params.extra_args = {"diffusion_read_only": True}
+        scheduler.add_request(request)
+    lookup = Mock(wraps=scheduler._get_local_prefix_cache_hit)
+    monkeypatch.setattr(scheduler, "_get_local_prefix_cache_hit", lookup)
+    scheduler.schedule()
+    assert len(lookup.call_args_list) == requests_count
+    assert all(call.args[1] is None for call in lookup.call_args_list)

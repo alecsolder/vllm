@@ -3,11 +3,21 @@
 
 import pytest
 import torch
+from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm
 
 from tests.kernels.quant_utils import FP8_DTYPE
 from tests.kernels.utils import fp8_allclose, fp8_ulp_distance, opcheck
 from vllm import ir
+from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
+from vllm.model_executor.models.diffusion_gemma_text_norm import (
+    fused_feedforward_inputs,
+    fused_feedforward_output,
+    fused_qkv_norm,
+)
+from vllm.model_executor.models.diffusion_gemma_vision_rmsnorm import (
+    DiffusionGemmaVisionRMSNorm,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -258,3 +268,220 @@ def test_gemma_rms_norm_mixed_input_weight_dtype(default_vllm_config) -> None:
 
     assert out.dtype == x.dtype
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("shape", "with_scale"),
+    [
+        ((1, 2520, 1152), True),
+        ((1, 2520, 16, 72), True),
+        ((1, 2520, 16, 72), False),
+    ],
+)
+@torch.inference_mode()
+def test_diffusion_gemma_vision_rms_norm_exact(
+    shape: tuple[int, ...], with_scale: bool
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    device = CUDA_DEVICES[0]
+    source = Gemma4RMSNorm(shape[-1], eps=1e-6, with_scale=with_scale).to(
+        device=device, dtype=torch.bfloat16
+    )
+    if with_scale:
+        source.weight.data.normal_(mean=1.0, std=0.1)
+    layer = DiffusionGemmaVisionRMSNorm(source)
+
+    set_random_seed(0)
+    hidden_states = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    row_scales = torch.logspace(
+        -5,
+        5,
+        hidden_states.numel() // shape[-1],
+        dtype=torch.float32,
+        device=device,
+    ).to(torch.bfloat16)
+    hidden_states.mul_(row_scales.reshape(*shape[:-1], 1))
+
+    expected = source(hidden_states)
+    actual = layer(hidden_states)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_diffusion_gemma_vision_rms_norm_cpu_preserves_input_and_parameters(
+    with_scale: bool,
+) -> None:
+    """The native fallback keeps HF's non-mutating FP32 contract."""
+    source = Gemma4RMSNorm(8, eps=1e-6, with_scale=with_scale).eval()
+    layer = DiffusionGemmaVisionRMSNorm(source)
+    hidden_states = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 8
+    original = hidden_states.clone()
+
+    expected = source(hidden_states)
+    actual = layer(hidden_states)
+
+    assert torch.equal(hidden_states, original)
+    assert torch.equal(actual, expected)
+    assert layer.training == source.training
+    assert layer.state_dict().keys() == source.state_dict().keys()
+    if with_scale:
+        assert layer.weight is source.weight
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_diffusion_gemma_vision_rms_norm_cpu_bf16_on_cuda_platform(
+    monkeypatch,
+    with_scale: bool,
+) -> None:
+    """A CUDA-capable host must still accept CPU tensors through HF fallback."""
+    from vllm.model_executor.models import diffusion_gemma_vision_rmsnorm
+
+    monkeypatch.setattr(
+        diffusion_gemma_vision_rmsnorm.current_platform, "is_cuda", lambda: True
+    )
+    source = Gemma4RMSNorm(8, eps=1e-6, with_scale=with_scale).to(torch.bfloat16)
+    layer = DiffusionGemmaVisionRMSNorm(source)
+    hidden_states = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8) / 8
+    original = hidden_states.clone()
+
+    actual = layer(hidden_states)
+
+    assert actual.device.type == "cpu"
+    assert torch.equal(actual, source(original))
+    assert torch.equal(hidden_states, original)
+
+
+def _assert_bf16_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    assert actual.is_contiguous()
+    torch.testing.assert_close(
+        actual.view(torch.int16), expected.view(torch.int16), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 33, 1049])
+@torch.inference_mode()
+def test_diffusion_gemma_text_feedforward_inputs_preserves_bf16_rounding(
+    num_tokens: int,
+) -> None:
+    """Dense, expert, and router inputs retain their distinct BF16 boundaries."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    set_random_seed(0)
+    device = CUDA_DEVICES[0]
+    hidden_size = 2816
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    if num_tokens == 33:
+        x = (x.float() * torch.logspace(-12, 12, hidden_size, device=device)).to(
+            x.dtype
+        )
+    w1, w2 = torch.randn(2, hidden_size, dtype=x.dtype, device=device).unbind()
+    scale = torch.randn(hidden_size, dtype=torch.float32, device=device)
+    root = torch.tensor(hidden_size**0.5, dtype=torch.float32, device=device)
+    if num_tokens:
+        dense = rms_norm_batch_invariant(x, w1)
+        expert = rms_norm_batch_invariant(x, w2)
+        router = rms_norm_batch_invariant(x, None)
+        router = (router * root.to(x.dtype)) * scale.to(x.dtype)
+        expected = dense, expert, router
+    else:
+        expected = tuple(torch.empty_like(x) for _ in range(3))
+
+    actual = fused_feedforward_inputs(x, w1, w2, scale, root)
+    for output, reference in zip(actual, expected):
+        _assert_bf16_bitwise_equal(output, reference)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "kv_heads", "head_dim"),
+    [
+        (0, 8, 256),
+        (1, 2, 512),
+        (33, 8, 256),
+        (33, 2, 512),
+        (1049, 8, 256),
+        (1049, 2, 512),
+    ],
+)
+@torch.inference_mode()
+def test_diffusion_gemma_text_qkv_norm_preserves_packed_head_layout(
+    num_tokens: int, kv_heads: int, head_dim: int
+) -> None:
+    """Normalize packed local/global QKV exactly, including strided split views."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    set_random_seed(0)
+    device = CUDA_DEVICES[0]
+    query_heads = 16
+    widths = (query_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim)
+    packed = torch.randn(num_tokens, sum(widths), dtype=torch.bfloat16, device=device)
+    if num_tokens == 33:
+        packed = (
+            packed.float() * torch.logspace(-12, 12, sum(widths), device=device)
+        ).to(packed.dtype)
+    wq, wk = torch.randn(2, head_dim, dtype=packed.dtype, device=device).unbind()
+    views = packed.split(widths, dim=-1)
+    if num_tokens > 1:
+        assert all(not value.is_contiguous() for value in views)
+    expected: list[torch.Tensor] = []
+    if num_tokens:
+        for value, weight, width in zip(views, (wq, wk, None), widths):
+            normalized = rms_norm_batch_invariant(
+                value.view(num_tokens, -1, head_dim), weight
+            )
+            assert isinstance(normalized, torch.Tensor)
+            expected.append(normalized.view(num_tokens, width))
+    else:
+        expected = [torch.empty_like(value) for value in views]
+
+    actual = fused_qkv_norm(packed, wq, wk, query_heads, kv_heads, head_dim)
+    for output, reference in zip(actual, expected):
+        _assert_bf16_bitwise_equal(output, reference)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "values"),
+    [
+        (0, "random"),
+        (1, "random"),
+        (33, "extreme"),
+        (33, "cancellation"),
+        (1049, "random"),
+    ],
+)
+@torch.inference_mode()
+def test_diffusion_gemma_text_feedforward_output_preserves_bf16_rounding(
+    num_tokens: int, values: str
+) -> None:
+    """Keep three RMS reductions, residual addition, and layer scaling bitwise."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    set_random_seed(0)
+    device = CUDA_DEVICES[0]
+    hidden_size = 2816
+    a, b, residual = torch.randn(
+        3, num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    ).unbind()
+    w1, w2, w3 = torch.randn(3, hidden_size, dtype=a.dtype, device=device).unbind()
+    scale = torch.tensor([1.328125], dtype=a.dtype, device=device)
+    if values == "extreme":
+        factor = torch.logspace(-12, 12, hidden_size, device=device)
+        a, b, residual = (
+            (value.float() * factor).to(a.dtype) for value in (a, b, residual)
+        )
+    elif values == "cancellation":
+        b = -a
+        w2 = w1
+    if num_tokens:
+        first = rms_norm_batch_invariant(a, w1)
+        second = rms_norm_batch_invariant(b, w2)
+        combined = first + second
+        norm = rms_norm_batch_invariant(combined, w3)
+        expected = (norm + residual) * scale
+    else:
+        expected = torch.empty_like(a)
+
+    actual = fused_feedforward_output(a, b, residual, w1, w2, w3, scale)
+    _assert_bf16_bitwise_equal(actual, expected)

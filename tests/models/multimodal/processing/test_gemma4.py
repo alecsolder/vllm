@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,6 +10,9 @@ import torch
 from PIL import Image as PILImage
 
 from vllm.exceptions import VLLMValidationError
+from vllm.model_executor.models.diffusion_gemma import (
+    DiffusionGemmaForConditionalGeneration,
+)
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
     Gemma4ImagePixelInputs,
@@ -23,6 +27,40 @@ from ...utils import build_model_context
 
 # TODO: to be updated to "google/gemma-4-e2b-it" once the models are available
 GEMMA4_MODEL_ID = "google/gemma-4-E2B-it"
+
+
+def test_diffusion_gemma_shared_image_encoder_without_lora(monkeypatch):
+    """Diffusion's shared image path must work without Gemma4's LoRA setup."""
+    model = DiffusionGemmaForConditionalGeneration.__new__(
+        DiffusionGemmaForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.model_dtype = torch.float32
+    model.config = SimpleNamespace(
+        vision_config=SimpleNamespace(pooling_kernel_size=1, position_embedding_size=1)
+    )
+    model.vision_tower = SimpleNamespace(
+        config=SimpleNamespace(standardize=False),
+        patch_embedder=lambda pixels, positions, padding: pixels,
+        encoder=lambda **kwargs: SimpleNamespace(
+            last_hidden_state=kwargs["inputs_embeds"]
+        ),
+        pooler=lambda **kwargs: (
+            kwargs["hidden_states"],
+            ~kwargs["padding_positions"],
+        ),
+    )
+    model.embed_vision = lambda inputs_embeds: inputs_embeds + 1
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (GiB_bytes, 2 * GiB_bytes)
+    )
+    pixels = torch.zeros(1, 2, 768)
+    embeddings = model.embed_multimodal(
+        pixel_values=pixels,
+        pixel_position_ids=torch.zeros(1, 2, 2, dtype=torch.long),
+    )
+    assert len(embeddings) == 1
+    torch.testing.assert_close(embeddings[0], pixels[0] + 1)
 
 
 def test_gemma4_image_schema_accepts_variable_patch_counts():

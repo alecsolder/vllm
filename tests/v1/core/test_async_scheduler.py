@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict, deque
 from collections.abc import Callable
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
+from vllm.lora.request import LoRARequest
+from vllm.multimodal.inputs import PlaceholderRange
+from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar
@@ -64,6 +68,713 @@ def test_stop_by_max_tokens(max_tokens: int):
     assert req1.num_output_tokens == max_tokens
     # Ensure we aren't scheduling more tokens than necessary.
     assert total_num_scheduled_tokens == expected_total_num_scheduled_tokens
+
+
+@pytest.mark.parametrize("extra_keys", [False, True], ids=["text", "mm-lora-salt"])
+@pytest.mark.parametrize("is_stale", [False, True], ids=["running", "stale"])
+@pytest.mark.parametrize(
+    "prior,count,max_tokens,max_model_len,min_tokens",
+    [
+        (0, 256, 256, 512, 0),
+        (0, 5, 256, 512, 0),
+        (3, 8, 5, 512, 0),
+        (3, 8, 256, 36, 0),
+        (3, 8, 5, 36, 0),
+        (5, 8, 5, 512, 0),
+        (3, 8, 256, 34, 0),
+        (0, 0, 256, 512, 0),
+        (0, 8, 256, 33, 5),
+    ],
+    ids=[
+        "canvas",
+        "short",
+        "output-cap",
+        "model-cap",
+        "both-caps",
+        "exhausted-output",
+        "exhausted-model",
+        "empty",
+        "cap-before-min",
+    ],
+)
+def test_diffusion_read_output_matches_tokenwise_state(
+    extra_keys, is_stale, prior, count, max_tokens, max_model_len, min_tokens
+):
+    """Batch append preserves the old token/hash/stop and async retirement state."""
+    positions = [PlaceholderRange(17, 3), PlaceholderRange(25, 3)]
+    read, ordinary = create_requests(
+        2,
+        num_tokens=31,
+        max_tokens=max_tokens,
+        ignore_eos=True,
+        same_prompt=True,
+        mm_positions=[positions, positions] if extra_keys else None,
+        mm_hashes_list=[["image-a", "image-b"]] * 2 if extra_keys else None,
+    )
+    scheduler = object.__new__(AsyncScheduler)
+    scheduler.max_model_len = max_model_len
+    scheduler.kv_cache_manager = Mock()
+    results = []
+    for is_read, request in ((True, read), (False, ordinary)):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.extra_args = {"diffusion_read_only": is_read}
+        request.sampling_params.min_tokens = min_tokens
+        if extra_keys:
+            request.cache_salt = "read-append-salt"
+            request.lora_request = LoRARequest("read-append-adapter", 1, "/unused")
+            request.block_hashes.clear()
+            request.update_block_hashes()
+        request.append_output_token_ids([6] * prior)
+        old_hashes = request.block_hashes.copy()
+        request.status = RequestStatus.PREEMPTED if is_stale else RequestStatus.RUNNING
+        request.num_output_placeholders = 0 if is_stale else count
+        request.num_computed_tokens = request.num_tokens + count
+        tokens = list(range(100, 100 + count))
+        scheduler.kv_cache_manager.cache_blocks.reset_mock()
+        result, stopped = scheduler._update_request_with_output(
+            request, tokens, is_stale=is_stale
+        )
+        assert result is tokens
+        assert request.block_hashes[: len(old_hashes)] == old_hashes
+        assert len(request.block_hashes) == request.num_tokens // 16
+        assert request.num_output_placeholders == (
+            0 if is_stale else count - len(result)
+        )
+        if is_stale:
+            scheduler.kv_cache_manager.cache_blocks.assert_not_called()
+        elif is_read:
+            scheduler.kv_cache_manager.cache_blocks.assert_called_once_with(request, 31)
+        results.append((result, stopped))
+    assert results[0] == results[1]
+    assert list(read.output_token_ids) == list(ordinary.output_token_ids)
+    assert list(read.all_token_ids) == list(ordinary.all_token_ids)
+    assert read.block_hashes == ordinary.block_hashes
+    assert (read.status, read.stop_reason) == (ordinary.status, ordinary.stop_reason)
+
+
+@pytest.mark.parametrize("stop_kind", ["eos", "token", "repetition"])
+def test_diffusion_read_output_preserves_token_dependent_stops(stop_kind):
+    """EOS/token stops beat length at the same token; repetition stops early."""
+    max_tokens = 3 if stop_kind == "repetition" else 2
+    read, ordinary = create_requests(
+        2, num_tokens=31, max_tokens=max_tokens, ignore_eos=True, same_prompt=True
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.max_model_len = 512
+    results = []
+    for is_read, request in ((True, read), (False, ordinary)):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.extra_args = {"diffusion_read_only": is_read}
+        if stop_kind == "eos":
+            request.sampling_params._eos_token_id = 7
+        elif stop_kind == "token":
+            request.sampling_params.stop_token_ids = [7]
+        else:
+            request.sampling_params.repetition_detection = RepetitionDetectionParams(
+                max_pattern_size=1, min_count=2
+            )
+        request.status = RequestStatus.RUNNING
+        tokens = [4, 4, 9] if stop_kind == "repetition" else [4, 7, 9]
+        result, stopped = scheduler._update_request_with_output(request, tokens)
+        assert result is tokens
+        assert len(result) == 2 and stopped
+        results.append((result, request.status, request.stop_reason))
+    assert results[0] == results[1]
+    expected_status = (
+        RequestStatus.FINISHED_REPETITION
+        if stop_kind == "repetition"
+        else RequestStatus.FINISHED_STOPPED
+    )
+    expected_reason = {"eos": None, "token": 7, "repetition": "repetition_detected"}
+    assert results[0][1:] == (expected_status, expected_reason[stop_kind])
+
+
+@pytest.mark.parametrize("read_only", [True, 1])
+@pytest.mark.parametrize("prefill_chunk_size", [4, 8])
+def test_diffusion_read_does_not_schedule_a_second_canvas(
+    read_only, prefill_chunk_size
+):
+    """Read outputs finish after one canvas; ordinary diffusion can keep going."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        long_prefill_token_threshold=prefill_chunk_size,
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    read, ordinary = create_requests(num_requests=2, num_tokens=8, max_tokens=4)
+    read.sampling_params = read.sampling_params.clone()
+    read.sampling_params.extra_args = {"diffusion_read_only": read_only}
+    for request in (read, ordinary):
+        scheduler.add_request(request)
+
+    for _ in range(8 // prefill_chunk_size):
+        prefill = scheduler.schedule()
+        assert prefill.num_scheduled_tokens[read.request_id] == prefill_chunk_size
+        assert read.num_output_placeholders == 0
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[read.request_id] == 4
+    assert read.num_output_placeholders == 4
+
+    # The first canvas is still in flight: only ordinary diffusion needs more.
+    ahead = scheduler.schedule()
+    assert read.request_id not in ahead.num_scheduled_tokens
+    assert ordinary.request_id in ahead.num_scheduled_tokens
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+@pytest.mark.parametrize("reasoning_steps", [0, 2, 64])
+@pytest.mark.parametrize("prefill_chunk_size", [4, 8])
+def test_diffusion_read_repeats_only_after_intermediate_output(
+    steps, reasoning_steps, prefill_chunk_size, monkeypatch
+):
+    """Empty intermediate outputs release one pass; only the final canvas ends it."""
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        long_prefill_token_threshold=prefill_chunk_size,
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    (read,) = create_requests(1, num_tokens=8, max_tokens=4, ignore_eos=True)
+    seed = [1, 2, 3, 4]
+    read.sampling_params.extra_args = {
+        "diffusion_read_only": True,
+        "diffusion_seed_canvas": seed,
+        "diffusion_read_steps": steps,
+    }
+    if reasoning_steps:
+        read.sampling_params.extra_args.update(
+            diffusion_reasoning_positions=[0, 1],
+            diffusion_reasoning_forbidden_token_ids=[],
+            diffusion_reasoning_steps=reasoning_steps,
+        )
+    scheduler.add_request(read)
+    total_steps = steps + reasoning_steps
+    for chunk in range(8 // prefill_chunk_size):
+        scheduled = scheduler.schedule()
+        fused = total_steps == 1 and chunk == 8 // prefill_chunk_size - 1
+        assert scheduled.num_scheduled_tokens[read.request_id] == (
+            prefill_chunk_size + (4 if fused else 0)
+        )
+        assert bool(scheduled.scheduled_spec_decode_tokens) == fused
+        if not fused:
+            result = _make_model_runner_output(scheduled)
+            result.sampled_token_ids = [[]]
+            scheduler.update_from_output(scheduled, result)
+
+    for step in range(total_steps):
+        if total_steps > 1:
+            scheduled = scheduler.schedule()
+            assert scheduled.num_scheduled_tokens == {read.request_id: 4}
+        assert len(scheduled.scheduled_spec_decode_tokens[read.request_id]) == 4
+        assert read.num_output_placeholders == 4
+        assert not scheduler.schedule().num_scheduled_tokens
+        result = _make_model_runner_output(scheduled)
+        result.sampled_token_ids = [seed if step == total_steps - 1 else []]
+        scheduler.update_from_output(scheduled, result)
+        assert read.num_output_placeholders == 0
+        if step < total_steps - 1:
+            assert read.num_computed_tokens == read.num_prompt_tokens
+            assert not read.output_token_ids
+            assert read.status == RequestStatus.RUNNING
+
+    assert list(read.output_token_ids) == seed
+    assert read.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert not scheduler.schedule().num_scheduled_tokens
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+def test_diffusion_read_defers_a_canvas_that_exceeds_remaining_budget(
+    steps, monkeypatch
+):
+    """Budget pressure defers a whole read while smaller canvases still progress."""
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "0")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        max_num_seqs=3,
+        max_num_batched_tokens=6,
+        long_prefill_token_threshold=2,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    reads = create_requests(3, num_tokens=2, max_tokens=4, ignore_eos=True)
+    for read, length in zip(reads, (4, 4, 2)):
+        read.max_tokens = length
+        read.sampling_params = read.sampling_params.clone()
+        read.sampling_params.max_tokens = length
+        read.sampling_params.extra_args = {
+            "diffusion_read_only": True,
+            "diffusion_seed_canvas": [1] * length,
+            "diffusion_read_steps": steps,
+        }
+        scheduler.add_request(read)
+    prefill = scheduler.schedule()
+    assert list(prefill.num_scheduled_tokens.values()) == [2, 2, 2]
+    result = _make_model_runner_output(prefill)
+    result.sampled_token_ids = [[], [], []]
+    scheduler.update_from_output(prefill, result)
+
+    first, deferred, smaller = reads
+    for step in range(steps):
+        batch = scheduler.schedule()
+        assert batch.num_scheduled_tokens == {
+            first.request_id: 4,
+            smaller.request_id: 2,
+        }
+        assert deferred.num_computed_tokens == deferred.num_prompt_tokens
+        assert deferred.num_output_placeholders == 0
+        assert len(deferred.spec_token_ids) == 4
+        next_batch = scheduler.schedule()
+        assert next_batch.num_scheduled_tokens == {deferred.request_id: 4}
+        assert not scheduler.schedule().num_scheduled_tokens
+
+        for scheduled in (batch, next_batch):
+            result = _make_model_runner_output(scheduled)
+            result.sampled_token_ids = [
+                [1] * len(tokens) if step == steps - 1 else []
+                for tokens in scheduled.scheduled_spec_decode_tokens.values()
+            ]
+            scheduler.update_from_output(scheduled, result)
+        assert all(read.num_output_placeholders == 0 for read in reads)
+    assert [list(read.output_token_ids) for read in reads] == [[1] * 4] * 2 + [[1] * 2]
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+@pytest.mark.parametrize("stale_tokens", [[], [1, 2, 3, 4]])
+def test_diffusion_read_reset_drops_inflight_pass_before_restarting(
+    stale_tokens, monkeypatch
+):
+    """A reset drops either intermediate or final stale output without underflow."""
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    (read,) = create_requests(1, num_tokens=8, max_tokens=4, ignore_eos=True)
+    read.sampling_params.extra_args = {
+        "diffusion_read_only": True,
+        "diffusion_seed_canvas": [1, 2, 3, 4],
+        "diffusion_read_steps": 2,
+    }
+    scheduler.add_request(read)
+    prefill = scheduler.schedule()
+    result = _make_model_runner_output(prefill)
+    result.sampled_token_ids = [[]]
+    scheduler.update_from_output(prefill, result)
+    stale = scheduler.schedule()
+    assert read.num_output_placeholders == 4
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert read.num_preemptions == 1
+    assert read.num_output_placeholders == 0
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens == {read.request_id: 8}
+    assert not resumed.scheduled_spec_decode_tokens
+    result = _make_model_runner_output(stale)
+    result.sampled_token_ids = [stale_tokens]
+    scheduler.update_from_output(stale, result)
+    assert read.num_computed_tokens == 8
+    assert read.num_output_placeholders == 0
+    assert read.num_stale_output_tokens == 0
+    assert not read.output_token_ids
+
+    result = _make_model_runner_output(resumed)
+    result.sampled_token_ids = [[]]
+    scheduler.update_from_output(resumed, result)
+    for tokens in ([], [1, 2, 3, 4]):
+        scheduled = scheduler.schedule()
+        assert scheduled.num_scheduled_tokens == {read.request_id: 4}
+        assert not scheduler.schedule().num_scheduled_tokens
+        result = _make_model_runner_output(scheduled)
+        result.sampled_token_ids = [tokens]
+        scheduler.update_from_output(scheduled, result)
+        assert read.num_output_placeholders == 0
+    assert list(read.output_token_ids) == [1, 2, 3, 4]
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("fuse", [False, True])
+@pytest.mark.parametrize("prompt_len, tail", [(352, 16), (357, 5)])
+def test_coadmitted_diffusion_reads_share_prefix_and_schedule_one_canvas(
+    warm, fuse, prompt_len, tail, monkeypatch
+):
+    """Even a full APC hit retains the final prompt block before the canvas."""
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1" if fuse else "0")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        num_speculative_tokens=256,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    if warm:
+        cached = create_requests(
+            1, num_tokens=prompt_len, same_prompt=True, req_ids=["warmup"]
+        )[0]
+        scheduler.add_request(cached)
+        prefill = scheduler.schedule()
+        result = _make_model_runner_output(prefill)
+        result.sampled_token_ids = [[]]
+        scheduler.update_from_output(prefill, result)
+        scheduler.finish_requests([cached.request_id], RequestStatus.FINISHED_ABORTED)
+
+    requests = create_requests(
+        6, num_tokens=prompt_len, max_tokens=256, same_prompt=True
+    )
+    for request in requests:
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.extra_args = {
+            "diffusion_read_only": True,
+            "diffusion_seed_canvas": [1] * 256,
+        }
+        scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    assert len(prefill.num_scheduled_tokens) == 6
+    prompt_work = tail * 6 if warm else prompt_len + tail * 5
+    assert prefill.total_num_scheduled_tokens == prompt_work + (1536 if fuse else 0)
+    assert [r.num_computed_tokens for r in prefill.scheduled_new_reqs] == [
+        prompt_len - tail if warm else 0,
+        *([prompt_len - tail] * 5),
+    ]
+    assert all(r.num_tokens == prompt_len for r in requests)
+    if fuse:
+        assert list(prefill.scheduled_spec_decode_tokens.values()) == [[1] * 256] * 6
+    else:
+        canvas = scheduler.schedule()
+        assert list(canvas.num_scheduled_tokens.values()) == [256] * 6
+    assert not scheduler.schedule().num_scheduled_tokens
+
+
+@pytest.mark.parametrize(
+    "read_only, fuse",
+    [(True, False), (True, True), (False, False)],
+    ids=["read", "fused-read", "ordinary"],
+)
+def test_read_canvas_kv_is_not_reused_as_causal_prompt(read_only, fuse, monkeypatch):
+    """Reads cache only prompt KV; ordinary generation also caches computed output."""
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1" if fuse else "0")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        num_speculative_tokens=16 if read_only else None,
+        speculative_method="ngram_gpu" if read_only else None,
+        use_v2_model_runner=True,
+    )
+    if read_only:
+        scheduler.num_sampled_tokens_per_step = 0
+    (request,) = create_requests(
+        1,
+        num_tokens=32,
+        max_tokens=16 if read_only else 17,
+        same_prompt=True,
+        ignore_eos=read_only,
+    )
+    if read_only:
+        request.sampling_params.extra_args = {
+            "diffusion_read_only": True,
+            "diffusion_seed_canvas": [1] * 16,
+        }
+    scheduler.add_request(request)
+    while not request.is_finished():
+        scheduled = scheduler.schedule()
+        assert request.request_id in scheduled.num_scheduled_tokens
+        result = _make_model_runner_output(scheduled)
+        if read_only:
+            result.sampled_token_ids = (
+                [[0] * 16] if scheduled.scheduled_spec_decode_tokens else [[]]
+            )
+        scheduler.update_from_output(scheduled, result)
+    assert request.num_computed_tokens == 48
+
+    (replay,) = create_requests(1, num_tokens=49, same_prompt=True, req_ids=["replay"])
+    scheduler.add_request(replay)
+    scheduled = scheduler.schedule()
+    assert scheduled.scheduled_new_reqs[0].num_computed_tokens == (
+        32 if read_only else 48
+    )
+
+
+@pytest.mark.parametrize("prefill_chunk_size", [4, 8])
+@pytest.mark.parametrize("canvas_length", [1, 3, 4])
+@pytest.mark.parametrize("cancel_read", [False, True])
+def test_fused_read_finishes_with_final_prompt_chunk(
+    prefill_chunk_size, canvas_length, cancel_read, monkeypatch
+):
+    """Mixed diffusion returns a complete read unless it was already cancelled."""
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        long_prefill_token_threshold=prefill_chunk_size,
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    read, ordinary = create_requests(2, num_tokens=8, max_tokens=4, ignore_eos=True)
+    read.sampling_params = read.sampling_params.clone()
+    read.max_tokens = canvas_length
+    read.sampling_params.max_tokens = canvas_length
+    seed = list(range(1, canvas_length + 1))
+    read.sampling_params.extra_args = {
+        "diffusion_read_only": True,
+        "diffusion_seed_canvas": seed,
+    }
+    for request in (read, ordinary):
+        scheduler.add_request(request)
+    if prefill_chunk_size == 4:
+        prefill = scheduler.schedule()
+        assert list(prefill.num_scheduled_tokens.values()) == [4, 4]
+        assert not prefill.scheduled_spec_decode_tokens
+        result = _make_model_runner_output(prefill)
+        result.sampled_token_ids = [[], []]
+        scheduler.update_from_output(prefill, result)
+
+    fused = scheduler.schedule()
+    assert fused.num_scheduled_tokens == {
+        read.request_id: prefill_chunk_size + canvas_length,
+        ordinary.request_id: prefill_chunk_size,
+    }
+    assert fused.scheduled_spec_decode_tokens == {read.request_id: seed}
+    assert read.num_output_placeholders == canvas_length
+    assert ordinary.num_output_placeholders == 0
+    ahead = scheduler.schedule()
+    assert read.request_id not in ahead.num_scheduled_tokens
+    assert ordinary.request_id in ahead.num_scheduled_tokens
+
+    old_hashes = read.block_hashes.copy()
+    if cancel_read:
+        scheduler.finish_requests(read.request_id, RequestStatus.FINISHED_ABORTED)
+    result = _make_model_runner_output(fused)
+    result.sampled_token_ids = [seed, []]
+    scheduler.update_from_output(fused, result)
+    assert not ordinary.output_token_ids
+    if cancel_read:
+        assert read.status == RequestStatus.FINISHED_ABORTED
+        assert not read.output_token_ids
+        assert read.block_hashes == old_hashes
+    else:
+        assert read.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        assert read.num_output_placeholders == 0
+        assert read.num_computed_tokens == 8 + canvas_length
+        assert list(read.output_token_ids) == seed
+
+    result = _make_model_runner_output(ahead)
+    result.sampled_token_ids = [[5, 6, 7, 8]]
+    scheduler.update_from_output(ahead, result)
+    assert list(ordinary.output_token_ids) == [5, 6, 7, 8]
+    assert ordinary.num_output_placeholders == 0
+    assert ordinary.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+def test_fused_read_with_multimodal_prompt(monkeypatch):
+    """A complete multimodal prefill may carry its read canvas in one step."""
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        disable_chunked_mm_input=True,
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    scheduler.max_num_encoder_input_tokens = 8
+    scheduler.encoder_cache_manager.cache_size = 8
+    scheduler.encoder_cache_manager.num_free_slots = 8
+    scheduler.encoder_cache_manager.num_freeable_slots = 8
+    (read,) = create_requests(
+        1,
+        num_tokens=8,
+        max_tokens=4,
+        ignore_eos=True,
+        mm_positions=[[PlaceholderRange(offset=1, length=4)]],
+    )
+    seed = [1, 2, 3, 4]
+    read.sampling_params = read.sampling_params.clone()
+    read.sampling_params.extra_args = {
+        "diffusion_read_only": True,
+        "diffusion_seed_canvas": seed,
+    }
+    scheduler.add_request(read)
+
+    fused = scheduler.schedule()
+
+    assert fused.num_scheduled_tokens == {read.request_id: 12}
+    assert fused.scheduled_spec_decode_tokens == {read.request_id: seed}
+    assert fused.scheduled_encoder_inputs == {read.request_id: [0]}
+    assert read.num_output_placeholders == 4
+
+
+@pytest.mark.parametrize("token_budget", [8, 11, 12])
+@pytest.mark.parametrize("canvas_length", [1, 4])
+def test_fused_read_never_schedules_a_partial_canvas(
+    token_budget, canvas_length, monkeypatch
+):
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        max_num_seqs=1,
+        max_num_batched_tokens=token_budget,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    (read,) = create_requests(1, num_tokens=8, max_tokens=canvas_length)
+    seed = list(range(1, canvas_length + 1))
+    read.sampling_params.extra_args = {
+        "diffusion_read_only": True,
+        "diffusion_seed_canvas": seed,
+    }
+    scheduler.add_request(read)
+    scheduled = scheduler.schedule()
+    if token_budget >= 8 + canvas_length:
+        assert scheduled.num_scheduled_tokens[read.request_id] == 8 + canvas_length
+        assert scheduled.scheduled_spec_decode_tokens == {read.request_id: seed}
+    else:
+        assert scheduled.num_scheduled_tokens[read.request_id] == 8
+        assert not scheduled.scheduled_spec_decode_tokens
+        assert (
+            scheduler.schedule().num_scheduled_tokens[read.request_id] == canvas_length
+        )
+
+
+@pytest.mark.parametrize("prefill_chunk_size", [8, 16])
+def test_fused_read_falls_back_when_only_prompt_kv_fits(
+    prefill_chunk_size, monkeypatch
+):
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_blocks=2,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        long_prefill_token_threshold=prefill_chunk_size,
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    scheduler.num_lookahead_tokens = 0
+    (read,) = create_requests(1, num_tokens=16, max_tokens=4)
+    read.sampling_params.extra_args = {
+        "diffusion_read_only": True,
+        "diffusion_seed_canvas": [1, 2, 3, 4],
+    }
+    scheduler.add_request(read)
+    for _ in range(16 // prefill_chunk_size):
+        scheduled = scheduler.schedule()
+        assert scheduled.num_scheduled_tokens[read.request_id] == prefill_chunk_size
+        assert not scheduled.scheduled_spec_decode_tokens
+    assert read.num_preemptions == 0
+
+
+@pytest.mark.parametrize("fuse", [False, True])
+def test_coadmitted_diffusion_reads_schedule_heterogeneous_canvas_lengths(
+    fuse, monkeypatch
+):
+    monkeypatch.setenv("VLLM_DIFFUSION_FUSE_READ_PREFILL", "1" if fuse else "0")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        num_speculative_tokens=256,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    requests = create_requests(
+        4, num_tokens=100, max_tokens=256, same_prompt=True, ignore_eos=True
+    )
+    canvas_lengths = [245, 108, 54, 32]
+    answer_only_flags = [None, False, True, True]
+    answer_positions = [[1], [2, 20], [1, 53, 80], [1]]
+    detokenize_flags = [True, True, False, True]
+    for request, canvas_length, answer_only, positions, detokenize in zip(
+        requests,
+        canvas_lengths,
+        answer_only_flags,
+        answer_positions,
+        detokenize_flags,
+    ):
+        request.max_tokens = canvas_length
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.max_tokens = canvas_length
+        request.sampling_params.logprobs = 0
+        request.sampling_params.detokenize = detokenize
+        request.sampling_params.extra_args = {
+            "diffusion_read_only": True,
+            "diffusion_seed_canvas": [0] * canvas_length,
+            "diffusion_answer_positions": positions,
+        }
+        if answer_only is not None:
+            request.sampling_params.extra_args["diffusion_answer_only_logprobs"] = (
+                answer_only
+            )
+        scheduler.add_request(request)
+
+    prefill = scheduler.schedule()
+    assert [data.num_computed_tokens for data in prefill.scheduled_new_reqs] == [
+        0,
+        96,
+        96,
+        96,
+    ]
+    prompt_work = [100, 4, 4, 4]
+    if fuse:
+        assert list(prefill.num_scheduled_tokens.values()) == [
+            prompt + length for prompt, length in zip(prompt_work, canvas_lengths)
+        ]
+        canvas = prefill
+    else:
+        assert list(prefill.num_scheduled_tokens.values()) == prompt_work
+        result = _make_model_runner_output(prefill)
+        result.sampled_token_ids = [[], [], [], []]
+        scheduler.update_from_output(prefill, result)
+        canvas = scheduler.schedule()
+        assert list(canvas.num_scheduled_tokens.values()) == canvas_lengths
+    assert [len(tokens) for tokens in canvas.scheduled_spec_decode_tokens.values()] == (
+        canvas_lengths
+    )
+    assert [request.num_output_placeholders for request in requests] == canvas_lengths
+    assert not scheduler.schedule().num_scheduled_tokens
+
+    result = _make_model_runner_output(canvas)
+    result.sampled_token_ids = [[0] * length for length in canvas_lengths]
+    logprobs = Mock()
+    result.logprobs = logprobs
+    scheduler.update_from_output(canvas, result)
+    assert logprobs.slice_request.call_args_list == [
+        call(0, 245),
+        call(1, 108),
+        call(2, 2),
+        call(3, 32),
+    ]
+    oracles = create_requests(4, num_tokens=100, same_prompt=True)
+    for request, oracle, length in zip(requests, oracles, canvas_lengths):
+        for token in [0] * length:
+            oracle.append_output_token_ids(token)
+        assert list(request.output_token_ids) == [0] * length
+        assert request.num_tokens == 100 + length
+        assert request.num_output_placeholders == 0
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        assert request.block_hashes == oracle.block_hashes
+    assert scheduler.get_num_unfinished_requests() == 0
+
+    (replay,) = create_requests(1, num_tokens=356, same_prompt=True, req_ids=["replay"])
+    scheduler.add_request(replay)
+    scheduled = scheduler.schedule()
+    assert scheduled.scheduled_new_reqs[0].num_computed_tokens == 96
 
 
 def test_no_spec_decode_padding_up_to_max_model_len():

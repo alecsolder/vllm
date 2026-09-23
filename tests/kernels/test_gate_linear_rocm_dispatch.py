@@ -14,6 +14,7 @@ term; a biased gate must fall back so the bias is not silently dropped.
 import pytest
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.router.gate_linear as gate_linear_mod
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
@@ -23,6 +24,7 @@ def _make_gate(
     *,
     is_rocm: bool,
     is_cuda: bool = False,
+    is_hopper: bool = False,
     bias: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
     out_dtype: torch.dtype | None = torch.float32,
@@ -48,7 +50,11 @@ def _make_gate(
     platform = gate_linear_mod.current_platform
     monkeypatch.setattr(platform, "is_cuda", lambda: is_cuda)
     monkeypatch.setattr(platform, "is_rocm", lambda: is_rocm)
-    monkeypatch.setattr(platform, "is_device_capability", lambda *a, **k: False)
+    monkeypatch.setattr(
+        platform,
+        "is_device_capability",
+        lambda capability: is_hopper and capability == (9, 0),
+    )
     monkeypatch.setattr(platform, "is_device_capability_family", lambda *a, **k: False)
     if is_rocm:
         import vllm.platforms.rocm as rocm_platform
@@ -62,6 +68,45 @@ def _make_gate(
         out_dtype=out_dtype,
         params_dtype=params_dtype,
     )
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, None])
+def test_batch_invariant_disables_low_latency_bf16_gemm(
+    monkeypatch, out_dtype: torch.dtype | None
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.is_available",
+        lambda: True,
+    )
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        is_hopper=True,
+        out_dtype=out_dtype,
+    )
+    if out_dtype is None:
+        gate.set_out_dtype(torch.float32)
+    assert gate.allow_cublas_router_gemm
+    assert not gate.allow_ll_bf16_gemm
+
+    expected = torch.empty(3, 64)
+    calls = []
+
+    def fake_mm(left, right, **kwargs):
+        calls.append((left, right, kwargs))
+        return expected
+
+    monkeypatch.setattr(torch, "mm", fake_mm)
+    output, bias = gate(torch.empty(3, 2048, dtype=torch.bfloat16))
+    assert output is expected
+    assert bias is None
+    assert len(calls) == 1
+    left, right, kwargs = calls[0]
+    assert left.dtype == torch.bfloat16
+    assert right.data_ptr() == gate.weight.data_ptr()
+    assert kwargs == {"out_dtype": torch.float32}
 
 
 def test_rocm_no_bias_bf16_fp32_enables_fused_gemm(monkeypatch):

@@ -289,12 +289,19 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    CANONICAL_BLOCK_Q: tl.constexpr = 0,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
         KV_QUANT_MODE <= 3
     )
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
+
+    if CANONICAL_BLOCK_Q:
+        tl.static_assert(BLOCK_Q % CANONICAL_BLOCK_Q == 0)
+        tl.static_assert(
+            not IS_3D and not USE_MM_PREFIX and not USE_R_SWA and CHUNK_LOOKBACK < 0
+        )
 
     if USE_TD:
         tl.static_assert(
@@ -563,7 +570,22 @@ def kernel_unified_attention(
                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
             )
 
+        if CANONICAL_BLOCK_Q and SLIDING_WINDOW:
+            old_M, old_L = M, L
         M, L, P, alpha = softmax_step(S, M, L)
+        if CANONICAL_BLOCK_Q and SLIDING_WINDOW:
+            # Extra fully masked tiles change BF16 rounding through the running max.
+            # Preserve the original query block's first softmax iteration per row.
+            canonical_qpos_lo = (query_pos // CANONICAL_BLOCK_Q) * CANONICAL_BLOCK_Q
+            canonical_loop_lo = tl.maximum(
+                0,
+                (context_len + canonical_qpos_lo - SLIDING_WINDOW + 1) // TILE_SIZE,
+            )
+            canonical_active = j >= canonical_loop_lo
+            M = tl.where(canonical_active, M, old_M)
+            L = tl.where(canonical_active, L, old_L)
+            P = tl.where(canonical_active[:, None], P, 0.0)
+            alpha = tl.where(canonical_active, alpha, 1.0)
         acc = acc * alpha[:, None]
 
         if SLIDING_WINDOW:

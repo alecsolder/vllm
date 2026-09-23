@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -57,8 +58,10 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
@@ -144,6 +147,12 @@ class Scheduler(SchedulerInterface):
         # Diffusion models may not sample any tokens for a denoising step.
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
+        )
+        self._memo_read_prefix = (
+            os.environ.get("VLLM_DIFFUSION_MEMO_READ_PREFIX") == "1"
+        )
+        self._fuse_read_prefill = (
+            os.environ.get("VLLM_DIFFUSION_FUSE_READ_PREFILL") == "1"
         )
 
         # Create KVConnector for the Scheduler. Note that each Worker
@@ -407,6 +416,40 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    def _get_fused_read_canvas(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        token_budget: int,
+    ) -> list[int] | None:
+        """Return a text read canvas that fits beside its final prompt chunk."""
+        if (
+            not self._fuse_read_prefill
+            or self.num_sampled_tokens_per_step != 0
+            or not self.use_v2_model_runner
+            or request.num_output_placeholders
+            or request.num_tokens != request.num_prompt_tokens
+            or num_computed_tokens >= request.num_prompt_tokens
+            or num_computed_tokens + num_new_tokens != request.num_prompt_tokens
+            or request.sampling_params is None
+        ):
+            return None
+        extra = request.sampling_params.extra_args or {}
+        canvas = extra.get("diffusion_seed_canvas")
+        if (
+            not extra.get("diffusion_read_only")
+            or extra.get("diffusion_read_steps", 1) > 1
+            or extra.get("diffusion_reasoning_positions")
+            or not canvas
+            or len(canvas) > self.num_spec_tokens
+            or len(canvas) != request.max_tokens
+            or num_new_tokens + len(canvas) > token_budget
+            or request.num_prompt_tokens + len(canvas) > self.max_model_len
+        ):
+            return None
+        return canvas
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -523,15 +566,56 @@ class Scheduler(SchedulerInterface):
         return max(end - start, 0)
 
     def _get_local_prefix_cache_hit(
-        self, request: Request
+        self, request: Request, read_prefix_memo: dict | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
         connector = self.connector
         if connector is not None and connector.supports_divergent_local_hybrid_hits:
             return self.kv_cache_manager.get_computed_blocks_for_connector(request)
 
+        key = None
+        if (
+            read_prefix_memo is not None
+            and request.sampling_params is not None
+            and (request.sampling_params.extra_args or {}).get("diffusion_read_only")
+            is True
+            and not request.mm_features
+            and request.prompt_embeds is None
+            and request.prompt_is_token_ids is None
+            and request.lora_request is None
+            and not request.num_output_tokens
+            and self.kv_cache_manager.prefix_cache_lookup_enabled(request)
+        ):
+            key = (request.num_tokens, request.cache_salt, tuple(request.block_hashes))
+            cached = read_prefix_memo.get(key)
+            if cached is not None:
+                blocks, num_local, snapshots = cached
+                if all(
+                    block.ref_cnt > 0 and block.block_hash == block_hash
+                    for block, block_hash in snapshots
+                ):
+                    return blocks, num_local, 0, False
+
         blocks, num_local, shared_prefix_boundary = (
             self.kv_cache_manager.get_computed_blocks(request)
         )
+        if (
+            key is not None
+            and read_prefix_memo is not None
+            and num_local > 0
+            and num_local
+            == (request.num_tokens - 1) // self.block_size * self.block_size
+            and not shared_prefix_boundary
+        ):
+            # Misses/partial hits can grow after an earlier sibling allocates.
+            # Reuse only a maximal hit whose real blocks remain pinned and hashed.
+            snapshots = tuple(
+                (block, block.block_hash)
+                for group in blocks.blocks
+                for block in group
+                if not block.is_null
+            )
+            if all(block_hash is not None for _, block_hash in snapshots):
+                read_prefix_memo[key] = blocks, num_local, snapshots
         return blocks, num_local, shared_prefix_boundary, False
 
     def _reserve_prefill_lookahead(
@@ -618,8 +702,19 @@ class Scheduler(SchedulerInterface):
                 # count, we subtract (num_output_placeholders - 1) to remove any draft
                 # tokens, so that we can be sure no further steps are needed even if
                 # they are all rejected.
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
+                and (
+                    request.num_computed_tokens + 2 - request.num_output_placeholders
+                    >= request.num_prompt_tokens + request.max_tokens
+                    or (
+                        # Keep at most one read canvas pass in flight.
+                        self.num_sampled_tokens_per_step == 0
+                        and request.num_output_placeholders >= request.max_tokens
+                        and request.sampling_params is not None
+                        and (request.sampling_params.extra_args or {}).get(
+                            "diffusion_read_only"
+                        )
+                    )
+                )
             ):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
@@ -655,7 +750,20 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+            is_read_decode = (
+                self.num_sampled_tokens_per_step == 0
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and request.sampling_params is not None
+                and (request.sampling_params.extra_args or {}).get(
+                    "diffusion_read_only"
+                )
+            )
+            if (
+                not is_read_decode
+                and 0
+                < self.scheduler_config.long_prefill_token_threshold
+                < num_new_tokens
+            ):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
@@ -700,6 +808,11 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
+            if is_read_decode and num_new_tokens < request.max_tokens:
+                # A read pass consumes its entire canvas at once.
+                req_index += 1
+                continue
+
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -720,6 +833,15 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            fused_read_canvas = self._get_fused_read_canvas(
+                request,
+                request.num_computed_tokens,
+                num_new_tokens,
+                min(token_budget, input_budget - draft_slots),
+            )
+            if fused_read_canvas is not None:
+                num_new_tokens += len(fused_read_canvas)
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -732,6 +854,11 @@ class Scheduler(SchedulerInterface):
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+
+                    if fused_read_canvas is not None:
+                        num_new_tokens -= len(fused_read_canvas)
+                        fused_read_canvas = None
+                        continue
 
                     if (
                         self.connector is not None
@@ -806,7 +933,10 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if fused_read_canvas is not None:
+                scheduled_spec_decode_tokens[request_id] = fused_read_canvas
+                request.spec_token_ids = []
+            elif request.spec_token_ids:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -847,6 +977,23 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        # This memo lives only within the current waiting-admission pass.
+        read_prefix_memo: dict | None = None
+        if (
+            self._memo_read_prefix
+            and len(self.waiting) + len(self.skipped_waiting) > 1
+            and self.connector is None
+            and self.ec_connector is None
+            and not self.kv_cache_manager.enable_kv_cache_events
+            and not self.kv_cache_manager.coordinator.enable_partial_hash_hits
+            and not self.kv_cache_manager.coordinator.eagle_group_ids
+            and all(
+                type(group.kv_cache_spec) in (FullAttentionSpec, SlidingWindowSpec)
+                for group in self.kv_cache_config.kv_cache_groups
+            )
+        ):
+            read_prefix_memo = {}
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -919,7 +1066,7 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens,
                         request.shared_prefix_boundary,
                         hit_diverged,
-                    ) = self._get_local_prefix_cache_hit(request)
+                    ) = self._get_local_prefix_cache_hit(request, read_prefix_memo)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1021,6 +1168,7 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                fused_read_canvas = None
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -1127,6 +1275,15 @@ class Scheduler(SchedulerInterface):
                         # The request cannot be scheduled.
                         break
 
+                    fused_read_canvas = self._get_fused_read_canvas(
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        request_token_budget,
+                    )
+                    if fused_read_canvas is not None:
+                        num_new_tokens += len(fused_read_canvas)
+
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1159,19 +1316,24 @@ class Scheduler(SchedulerInterface):
                         + self._spec_decode_step_blocks()
                     )
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                    reserved_blocks=reserved_blocks,
-                    has_scheduled_reqs=bool(self.running),
-                )
+                while True:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
+                    if new_blocks is not None or fused_read_canvas is None:
+                        break
+                    num_new_tokens -= len(fused_read_canvas)
+                    fused_read_canvas = None
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1266,7 +1428,10 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                if pad_spec_decode:
+                if fused_read_canvas is not None:
+                    scheduled_spec_decode_tokens[request_id] = fused_read_canvas
+                    request.spec_token_ids = []
+                elif pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
@@ -1746,6 +1911,19 @@ class Scheduler(SchedulerInterface):
                 # already calculated encoder inputs and can skip here.
                 continue
 
+            # Cached embeddings still require an atomic decoder image span.
+            # Prefix caching may resume exactly at or inside that span.
+            if (
+                not self.is_encoder_decoder
+                and self.scheduler_config.disable_chunked_mm_input
+                and num_computed_tokens + num_new_tokens
+                < start_pos + num_encoder_tokens
+            ):
+                num_new_tokens = max(
+                    0, start_pos - (num_computed_tokens + shift_computed_tokens)
+                )
+                break
+
             if not self.is_encoder_decoder:
                 # We are not using the encoder cache for encoder-decoder models,
                 # yet.
@@ -1759,22 +1937,6 @@ class Scheduler(SchedulerInterface):
                     # previous step.
                     continue
 
-            # If no encoder input chunking is allowed, we do not want to
-            # partially schedule a multimodal item. If the scheduled range would
-            # only cover part of the mm input, roll back to before the mm item.
-            if (
-                self.scheduler_config.disable_chunked_mm_input
-                and num_computed_tokens < start_pos
-                and (num_computed_tokens + num_new_tokens)
-                < (start_pos + num_encoder_tokens)
-            ):
-                # Account for EAGLE shift when rolling back to avoid
-                # encoder cache miss. This ensures the scheduled range
-                # stops before start_pos even with the shift.
-                num_new_tokens = max(
-                    0, start_pos - (num_computed_tokens + shift_computed_tokens)
-                )
-                break
             if not self.encoder_cache_manager.can_allocate(
                 request, i, encoder_compute_budget, num_embeds_to_schedule
             ):
@@ -2145,7 +2307,18 @@ class Scheduler(SchedulerInterface):
                 and request.sampling_params.num_logprobs is not None
                 and logprobs
             ):
-                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+                num_logprob_positions = len(new_token_ids)
+                extra_args = request.sampling_params.extra_args or {}
+                if (
+                    extra_args.get("diffusion_read_only")
+                    and extra_args.get("diffusion_answer_only_logprobs")
+                    and not request.sampling_params.detokenize
+                ):
+                    answer_positions = extra_args["diffusion_answer_positions"]
+                    num_logprob_positions = sum(
+                        position < len(new_token_ids) for position in answer_positions
+                    )
+                new_logprobs = logprobs.slice_request(req_index, num_logprob_positions)
 
             if self.return_sampling_mask:
                 sampling_masks = model_runner_output.sampling_masks
@@ -2377,6 +2550,28 @@ class Scheduler(SchedulerInterface):
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         # is_stale is only used by the AsyncScheduler override.
+        sampling_params = request.sampling_params
+        if (
+            new_token_ids
+            and sampling_params is not None
+            and (sampling_params.extra_args or {}).get("diffusion_read_only")
+            and sampling_params.ignore_eos
+            and sampling_params.eos_token_id is None
+            and not sampling_params.stop
+            and not sampling_params.stop_token_ids
+            and sampling_params.repetition_detection is None
+        ):
+            num_accepted = min(
+                len(new_token_ids),
+                request.max_tokens - request.num_output_tokens,
+                self.max_model_len - request.num_tokens,
+            )
+            if num_accepted > 0:
+                # No token-dependent stop can precede this length boundary.
+                del new_token_ids[num_accepted:]
+                request.append_output_token_ids(new_token_ids)
+                return new_token_ids, check_stop(request, self.max_model_len)
+
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
@@ -2447,6 +2642,14 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
+            extra = (
+                request.sampling_params.extra_args if request.sampling_params else {}
+            )
+            read_canvas = (extra or {}).get("diffusion_seed_canvas")
+            if (extra or {}).get("diffusion_read_only") and isinstance(
+                read_canvas, list
+            ):
+                spec_token_ids = spec_token_ids[: len(read_canvas)]
             request.spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
             )

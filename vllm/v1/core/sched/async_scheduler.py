@@ -41,7 +41,18 @@ class AsyncScheduler(Scheduler):
             )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = self._spec_token_placeholders
+            extra = (
+                request.sampling_params.extra_args if request.sampling_params else {}
+            )
+            read_canvas = (extra or {}).get("diffusion_seed_canvas")
+            if (extra or {}).get("diffusion_read_only") and isinstance(
+                read_canvas, list
+            ):
+                request.spec_token_ids = self._spec_token_placeholders[
+                    : len(read_canvas)
+                ]
+            else:
+                request.spec_token_ids = self._spec_token_placeholders
 
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be
@@ -64,7 +75,15 @@ class AsyncScheduler(Scheduler):
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
-            self.kv_cache_manager.cache_blocks(
-                request, request.num_computed_tokens - request.num_output_placeholders
+            num_tokens_to_cache = (
+                request.num_computed_tokens - request.num_output_placeholders
             )
+            if request.sampling_params is not None and (
+                request.sampling_params.extra_args or {}
+            ).get("diffusion_read_only"):
+                # Read canvases have no causal commit pass.
+                num_tokens_to_cache = min(
+                    num_tokens_to_cache, request.num_prompt_tokens
+                )
+            self.kv_cache_manager.cache_blocks(request, num_tokens_to_cache)
         return new_token_ids, stopped

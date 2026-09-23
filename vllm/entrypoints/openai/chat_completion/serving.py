@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import math
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -41,6 +42,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    DiffusionAnswerDistribution,
+    DiffusionReadSpec,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.engine.protocol import (
@@ -54,7 +57,7 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
-from vllm.exceptions import GenerationError
+from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.inputs import EngineInput, MultiModalPlaceholders
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
@@ -68,6 +71,62 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
 logger = init_logger(__name__)
+
+
+def _pooled_answer_distribution(
+    token_ids: GenericSequence[int],
+    logprobs: GenericSequence[dict[int, Logprob] | None],
+    read: DiffusionReadSpec,
+) -> DiffusionAnswerDistribution:
+    """Expose pooled conditional scores outside the raw-model logprobs field."""
+    position = read.answer_positions[0]
+    if len(logprobs) == 1:
+        row = logprobs[0]
+    elif len(logprobs) == len(token_ids):
+        row = logprobs[position]
+    else:
+        raise ValueError("The mean answer read returned invalid score positions")
+    if row is None or set(row) != set(read.logprob_token_ids):
+        raise ValueError("The mean answer read returned invalid candidate scores")
+    values = [row[token].logprob for token in read.logprob_token_ids]
+    if any(not math.isfinite(value) or value > 1e-5 for value in values):
+        raise ValueError("The mean answer read returned invalid log probabilities")
+    probabilities = [math.exp(value) for value in values]
+    if abs(sum(probabilities) - 1.0) > 1e-5:
+        raise ValueError("The mean answer probabilities are not normalized")
+    selected = read.logprob_token_ids[max(range(len(values)), key=values.__getitem__)]
+    if token_ids[position] != selected:
+        raise ValueError("The mean answer token does not match its distribution")
+    return DiffusionAnswerDistribution(
+        answer_passes=read.steps,
+        answer_position=position,
+        token_ids=list(read.logprob_token_ids),
+        probabilities=probabilities,
+        log_probabilities=values,
+    )
+
+
+def _validate_diffusion_read_output(
+    token_ids: GenericSequence[int], read: DiffusionReadSpec
+) -> None:
+    if len(token_ids) != len(read.seed_canvas):
+        raise ValueError("The diffusion read returned an invalid canvas")
+    mutable_positions = set(read.answer_positions)
+    mutable_positions.update(read.reasoning_positions or ())
+    if any(
+        token_id != read.seed_canvas[i]
+        for i, token_id in enumerate(token_ids)
+        if i not in mutable_positions
+    ):
+        raise ValueError("The diffusion read changed a fixed canvas token")
+    if read.reasoning_positions is not None:
+        assert read.reasoning_forbidden_token_ids is not None
+        forbidden = frozenset(read.reasoning_forbidden_token_ids)
+        if any(
+            token_ids[position] < 0 or token_ids[position] in forbidden
+            for position in read.reasoning_positions
+        ):
+            raise ValueError("The diffusion read returned a forbidden reasoning token")
 
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
@@ -259,6 +318,14 @@ class OpenAIServingChat(GenerateBaseServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        if (
+            request.diffusion_reads is not None
+            and self._get_session_id(request, raw_request) is not None
+        ):
+            raise VLLMValidationError(
+                "diffusion_reads does not support sessions, including session headers.",
+                parameter="session_id",
+            )
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -352,6 +419,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     session_id=session_id,
                 )
             else:
+                child_sampling_params = request.to_child_sampling_params(
+                    sampling_params
+                )
                 if not request.include_reasoning:
                     reasoning_ended = True
                 elif request._grammar_from_parser:
@@ -381,6 +451,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     }
                     if parser is not None and parser.reasoning_parser is not None
                     else None,
+                    child_sampling_params=child_sampling_params,
                 )
 
             generators.append(generator)
@@ -949,16 +1020,38 @@ class OpenAIServingChat(GenerateBaseServing):
             self._raise_if_error(output.finish_reason, request_id)
             token_ids = output.token_ids
             out_logprobs = output.logprobs
+            logprob_token_ids = (
+                request.diffusion_reads[output.index].logprob_token_ids
+                if request.diffusion_reads is not None
+                else request.logprob_token_ids
+            )
+            logprob_token_positions = None
+            pooled_distribution = None
+            if request.diffusion_reads is not None:
+                read = request.diffusion_reads[output.index]
+                if read.answer_only_logprobs or read.reasoning_positions is not None:
+                    _validate_diffusion_read_output(token_ids, read)
+                if read.answer_only_logprobs:
+                    logprob_token_positions = read.answer_positions
+                if read.answer_pass_aggregation == "mean":
+                    if out_logprobs is None:
+                        raise ValueError("The mean answer read returned no scores")
+                    pooled_distribution = _pooled_answer_distribution(
+                        token_ids, out_logprobs, read
+                    )
 
-            if request.logprobs and (
-                request.top_logprobs is not None or request.logprob_token_ids
+            if pooled_distribution is not None:
+                logprobs = None
+            elif request.logprobs and (
+                request.top_logprobs is not None or logprob_token_ids
             ):
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
                     top_logprobs=out_logprobs,
                     num_output_top_logprobs=request.top_logprobs,
-                    logprob_token_ids=request.logprob_token_ids,
+                    logprob_token_ids=logprob_token_ids,
+                    logprob_token_positions=logprob_token_positions,
                     tokenizer=tokenizer,
                     return_as_token_id=request.return_tokens_as_token_ids,
                 )
@@ -1083,6 +1176,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
+                diffusion_answer_distribution=pooled_distribution,
                 finish_reason="tool_calls"
                 if is_finish_reason_tool_calls
                 else output.finish_reason
@@ -1244,6 +1338,7 @@ class OpenAIServingChat(GenerateBaseServing):
         tokenizer: TokenizerLike | None,
         num_output_top_logprobs: int | None = None,
         logprob_token_ids: list[int] | None = None,
+        logprob_token_positions: list[int] | None = None,
         return_as_token_id: bool | None = None,
     ) -> ChatCompletionLogProbs:
         """Create OpenAI-style logprobs."""
@@ -1254,8 +1349,23 @@ class OpenAIServingChat(GenerateBaseServing):
             if return_as_token_id is not None
             else self.return_tokens_as_token_ids
         )
-        for i, token_id in enumerate(token_ids):
-            step_top_logprobs = top_logprobs[i]
+        if logprob_token_positions is not None:
+            output_positions: GenericSequence[int] = logprob_token_positions
+            if len(top_logprobs) == len(logprob_token_positions):
+                logprob_positions: GenericSequence[int] = range(len(top_logprobs))
+            elif len(top_logprobs) == len(token_ids):
+                logprob_positions = logprob_token_positions
+            else:
+                raise ValueError("The diffusion read returned invalid logprobs")
+        else:
+            output_positions = range(len(token_ids))
+            logprob_positions = output_positions
+
+        for i, logprob_position in zip(
+            output_positions, logprob_positions, strict=True
+        ):
+            token_id = token_ids[i]
+            step_top_logprobs = top_logprobs[logprob_position]
             if step_top_logprobs is None or step_top_logprobs.get(token_id) is None:
                 if should_return_as_token_id:
                     token = format_token_id_placeholder(token_id)

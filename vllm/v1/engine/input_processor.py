@@ -3,6 +3,7 @@
 
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, Literal
 
 import vllm.envs as envs
@@ -99,6 +100,7 @@ class InputProcessor:
                 self.speculative_config,
                 self.structured_outputs_config,
                 self.tokenizer,
+                diffusion_config=self.vllm_config.diffusion_config,
             )
 
             if self.model_config.return_sampling_mask:
@@ -181,6 +183,58 @@ class InputProcessor:
         sampling_params.stop = []
         sampling_params.stop_token_ids = []
         sampling_params._all_stop_token_ids = set()
+
+    def process_child_sampling_params(
+        self,
+        params: SamplingParams,
+        prompt_len: int,
+        supported_tasks: tuple[SupportedTask, ...],
+    ) -> SamplingParams:
+        """Validate a child's independent params against an already rendered prompt."""
+        child = deepcopy(params)
+        self._validate_params(child, supported_tasks)
+        self._normalize_sampling_params(child, prompt_len)
+        return child
+
+    def _normalize_sampling_params(
+        self, sampling_params: SamplingParams, prompt_len: int
+    ) -> None:
+        if (sampling_params.extra_args or {}).get("diffusion_read_only"):
+            assert sampling_params.max_tokens is not None
+            if (
+                prompt_len + sampling_params.max_tokens
+                > self.model_config.max_model_len
+            ):
+                raise VLLMValidationError(
+                    "diffusion_read_only requires the prompt and complete canvas "
+                    "to fit within max_model_len.",
+                    parameter="max_tokens",
+                )
+            canvas_budget = self.scheduler_config.max_num_batched_tokens
+            if sampling_params.max_tokens > canvas_budget:
+                raise VLLMValidationError(
+                    "diffusion_read_only requires the complete canvas to fit "
+                    f"within max_num_batched_tokens ({canvas_budget}).",
+                    parameter="max_tokens",
+                    value=sampling_params.max_tokens,
+                )
+        if not 0 <= sampling_params.routed_experts_prompt_start <= prompt_len:
+            raise VLLMValidationError(
+                f"routed_experts_prompt_start must be between 0 and "
+                f"the prompt length ({prompt_len}), inclusive.",
+                parameter="routed_experts_prompt_start",
+                value=sampling_params.routed_experts_prompt_start,
+            )
+        if sampling_params.max_tokens is None:
+            sampling_params.max_tokens = self.model_config.max_model_len - prompt_len
+        sampling_params.update_from_generation_config(
+            self.generation_config_fields,
+            self.renderer.get_eos_token_id(),
+        )
+        if self.tokenizer is not None:
+            sampling_params.update_from_tokenizer(self.tokenizer)
+        if sampling_params.trace_decode_token_ids:
+            self._normalize_trace_replay_params(sampling_params, prompt_len)
 
     def _validate_lora(self, lora_request: LoRARequest | None) -> None:
         if lora_request is None:
@@ -356,27 +410,7 @@ class InputProcessor:
             prompt_len = length_from_prompt_token_ids_or_embeds(
                 prompt_token_ids, prompt_embeds
             )
-            if not 0 <= sampling_params.routed_experts_prompt_start <= prompt_len:
-                raise VLLMValidationError(
-                    f"routed_experts_prompt_start must be between 0 and "
-                    f"the prompt length ({prompt_len}), inclusive.",
-                    parameter="routed_experts_prompt_start",
-                    value=sampling_params.routed_experts_prompt_start,
-                )
-            # If unset max tokens, then generate up to the max_model_len.
-            if sampling_params.max_tokens is None:
-                sampling_params.max_tokens = (
-                    self.model_config.max_model_len - prompt_len
-                )
-
-            sampling_params.update_from_generation_config(
-                self.generation_config_fields,
-                self.renderer.get_eos_token_id(),
-            )
-            if self.tokenizer is not None:
-                sampling_params.update_from_tokenizer(self.tokenizer)
-            if sampling_params.trace_decode_token_ids:
-                self._normalize_trace_replay_params(sampling_params, prompt_len)
+            self._normalize_sampling_params(sampling_params, prompt_len)
         else:
             pooling_params = params.clone()
 

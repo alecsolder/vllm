@@ -15,7 +15,12 @@ from pydantic import BeforeValidator
 from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
-from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
+from vllm.config import (
+    DiffusionConfig,
+    ModelConfig,
+    SpeculativeConfig,
+    StructuredOutputsConfig,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
@@ -818,6 +823,7 @@ class SamplingParams(
         speculative_config: SpeculativeConfig | None,
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
+        diffusion_config: DiffusionConfig | None = None,
     ) -> None:
         self._validate_logprobs(model_config)
         self._validate_logit_bias(model_config)
@@ -826,7 +832,7 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(model_config)
         self._validate_spec_decode(speculative_config)
-        self._validate_diffusion(model_config)
+        self._validate_diffusion(model_config, diffusion_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
@@ -1045,7 +1051,12 @@ class SamplingParams(
                 "are not yet supported with speculative decoding."
             )
 
-    def _validate_diffusion(self, model_config: ModelConfig) -> None:
+    def _validate_diffusion(
+        self,
+        model_config: ModelConfig,
+        diffusion_config: DiffusionConfig | None = None,
+    ) -> None:
+        self._validate_diffusion_read_only(model_config, diffusion_config)
         if not model_config.is_diffusion:
             return
 
@@ -1065,6 +1076,358 @@ class SamplingParams(
                 "The temperature, min_p, seed, min_tokens, logit_bias, "
                 "bad_words, and allowed_token_ids sampling parameters "
                 "are not yet supported with diffusion models."
+            )
+
+    def _validate_diffusion_read_only(
+        self,
+        model_config: ModelConfig,
+        diffusion_config: DiffusionConfig | None,
+    ) -> None:
+        extra = self.extra_args or {}
+        convergence_stop = extra.get("diffusion_reasoning_convergence_stop", False)
+        if type(convergence_stop) is not bool:
+            raise VLLMValidationError(
+                "diffusion_reasoning_convergence_stop must be a boolean.",
+                parameter="diffusion_reasoning_convergence_stop",
+            )
+        read_keys: tuple[str, ...] = (
+            "diffusion_read_only",
+            "diffusion_seed_canvas",
+            "diffusion_answer_positions",
+            "diffusion_answer_only_logprobs",
+            "diffusion_read_steps",
+            "diffusion_answer_pass_aggregation",
+            "diffusion_read_self_conditioning",
+            "diffusion_read_self_conditioning_scope",
+            "diffusion_reasoning_positions",
+            "diffusion_reasoning_forbidden_token_ids",
+            "diffusion_reasoning_steps",
+            "diffusion_reasoning_answer_noise",
+            "diffusion_reasoning_token_noise",
+            "diffusion_reasoning_token_proposals",
+            "diffusion_reasoning_schedule_steps",
+            "diffusion_reasoning_entropy_bound",
+            "diffusion_reasoning_round_feedback_logits",
+            "diffusion_reasoning_preserve_feedback",
+            "diffusion_reasoning_answer_feedback",
+            "diffusion_reasoning_unmasked_feedback",
+        )
+        unsupported_keys = ("diffusion_canvas_length", "diffusion_max_steps")
+        if convergence_stop:
+            read_keys += ("diffusion_reasoning_convergence_stop",)
+        if extra.get("diffusion_reasoning_seed") is not None:
+            read_keys += ("diffusion_reasoning_seed",)
+        if extra.get("diffusion_reasoning_known_positions") is not None:
+            read_keys += ("diffusion_reasoning_known_positions",)
+        if extra.get("diffusion_reasoning_delayed_suffix_positions") is not None:
+            read_keys += ("diffusion_reasoning_delayed_suffix_positions",)
+        if not any(key in extra for key in read_keys + unsupported_keys):
+            return
+        if not model_config.is_diffusion:
+            raise VLLMValidationError(
+                "Diffusion read options require a diffusion model.",
+                parameter="extra_args",
+            )
+        if any(key in extra for key in unsupported_keys):
+            raise VLLMValidationError(
+                "diffusion_canvas_length and diffusion_max_steps overrides are "
+                "not supported; use diffusion_read_steps for constrained reads.",
+                parameter="extra_args",
+            )
+
+        read_only = extra.get("diffusion_read_only", False)
+        if type(read_only) not in (bool, int) or read_only not in (0, 1):
+            raise VLLMValidationError(
+                "diffusion_read_only must be a boolean or integer 0 or 1.",
+                parameter="diffusion_read_only",
+            )
+        if not read_only:
+            if any(key in extra for key in read_keys[1:]):
+                raise VLLMValidationError(
+                    "Diffusion read options require diffusion_read_only=True.",
+                    parameter="diffusion_read_only",
+                )
+            return
+        steps = extra.get("diffusion_read_steps", 1)
+        if type(steps) is not int or not 1 <= steps <= 32:
+            raise VLLMValidationError(
+                "diffusion_read_steps must be an integer between 1 and 32.",
+                parameter="diffusion_read_steps",
+            )
+        aggregation = extra.get("diffusion_answer_pass_aggregation", "last")
+        if type(aggregation) is not str or aggregation not in ("last", "mean"):
+            raise VLLMValidationError(
+                "diffusion_answer_pass_aggregation must be 'last' or 'mean'.",
+                parameter="diffusion_answer_pass_aggregation",
+            )
+        if aggregation == "mean" and (
+            not extra.get("diffusion_reasoning_positions")
+            or not extra.get("diffusion_answer_only_logprobs")
+            or extra.get("diffusion_reasoning_preserve_feedback", False)
+        ):
+            raise VLLMValidationError(
+                "Mean answer reads require reasoning, answer-only logprobs, "
+                "and reasoning_preserve_feedback=False.",
+                parameter="diffusion_answer_pass_aggregation",
+            )
+        self_conditioning = extra.get("diffusion_read_self_conditioning", True)
+        if type(self_conditioning) not in (bool, int) or self_conditioning not in (
+            0,
+            1,
+        ):
+            raise VLLMValidationError(
+                "diffusion_read_self_conditioning must be a boolean or integer 0 or 1.",
+                parameter="diffusion_read_self_conditioning",
+            )
+        scope = extra.get("diffusion_read_self_conditioning_scope", "answer")
+        if type(scope) is not str or scope not in ("answer", "canvas"):
+            raise VLLMValidationError(
+                "diffusion_read_self_conditioning_scope must be 'answer' or 'canvas'.",
+                parameter="diffusion_read_self_conditioning_scope",
+            )
+        answer_only_logprobs = extra.get("diffusion_answer_only_logprobs", False)
+        if type(answer_only_logprobs) not in (
+            bool,
+            int,
+        ) or answer_only_logprobs not in (0, 1):
+            raise VLLMValidationError(
+                "diffusion_answer_only_logprobs must be a boolean or integer 0 or 1.",
+                parameter="diffusion_answer_only_logprobs",
+            )
+        if diffusion_config is None or diffusion_config.canvas_length is None:
+            raise VLLMValidationError(
+                "diffusion_read_only requires a configured diffusion canvas length.",
+                parameter="diffusion_read_only",
+            )
+
+        canvas_length = diffusion_config.canvas_length
+        seed_canvas = extra.get("diffusion_seed_canvas")
+        if (
+            not isinstance(seed_canvas, list)
+            or not seed_canvas
+            or len(seed_canvas) > canvas_length
+        ):
+            raise VLLMValidationError(
+                "diffusion_seed_canvas must contain between 1 and "
+                f"{canvas_length} token IDs.",
+                parameter="diffusion_seed_canvas",
+            )
+        vocab_size = model_config.get_vocab_size()
+        if any(
+            type(token) is not int or not 0 <= token < vocab_size
+            for token in seed_canvas
+        ):
+            raise VLLMValidationError(
+                "diffusion_seed_canvas must contain integer token IDs within "
+                "the model vocabulary.",
+                parameter="diffusion_seed_canvas",
+            )
+
+        positions = extra.get("diffusion_answer_positions")
+        if (
+            not isinstance(positions, list)
+            or not positions
+            or any(
+                type(pos) is not int or not 0 <= pos < len(seed_canvas)
+                for pos in positions
+            )
+            or len(set(positions)) != len(positions)
+        ):
+            raise VLLMValidationError(
+                "diffusion_answer_positions must be a nonempty list of unique "
+                "integer positions within the seed canvas.",
+                parameter="diffusion_answer_positions",
+            )
+        self._validate_diffusion_reasoning(seed_canvas, positions, vocab_size)
+        if not self.logprob_token_ids:
+            raise VLLMValidationError(
+                "diffusion_read_only requires nonempty logprob_token_ids.",
+                parameter="logprob_token_ids",
+            )
+        if self.max_tokens != len(seed_canvas) or not self.ignore_eos:
+            raise VLLMValidationError(
+                f"diffusion_read_only requires max_tokens={len(seed_canvas)} "
+                "to equal the seed canvas length and ignore_eos=True so the "
+                "complete canvas is returned.",
+                parameter="diffusion_read_only",
+            )
+        if self.stop or self.stop_token_ids:
+            raise VLLMValidationError(
+                "diffusion_read_only does not support stop or stop_token_ids.",
+                parameter="diffusion_read_only",
+            )
+        if (
+            self.top_k not in (-1, 0)
+            or self.top_p != 1.0
+            or self.presence_penalty != 0.0
+            or self.frequency_penalty != 0.0
+            or self.repetition_penalty != 1.0
+        ):
+            raise VLLMValidationError(
+                "diffusion_read_only does not support top_k, top_p, or penalties.",
+                parameter="diffusion_read_only",
+            )
+
+    def _validate_diffusion_reasoning(
+        self, seed_canvas: list[int], answer_positions: list[int], vocab_size: int
+    ) -> None:
+        extra = self.extra_args or {}
+        keys: tuple[str, ...] = (
+            "diffusion_reasoning_positions",
+            "diffusion_reasoning_forbidden_token_ids",
+            "diffusion_reasoning_steps",
+            "diffusion_reasoning_answer_noise",
+            "diffusion_reasoning_token_noise",
+            "diffusion_reasoning_token_proposals",
+            "diffusion_reasoning_schedule_steps",
+            "diffusion_reasoning_entropy_bound",
+            "diffusion_reasoning_round_feedback_logits",
+            "diffusion_reasoning_preserve_feedback",
+            "diffusion_reasoning_answer_feedback",
+            "diffusion_reasoning_unmasked_feedback",
+        )
+        seed = extra.get("diffusion_reasoning_seed")
+        if seed is not None:
+            keys += ("diffusion_reasoning_seed",)
+        known = extra.get("diffusion_reasoning_known_positions")
+        if known is not None:
+            keys += ("diffusion_reasoning_known_positions",)
+        delayed = extra.get("diffusion_reasoning_delayed_suffix_positions")
+        if extra.get("diffusion_reasoning_convergence_stop", False):
+            keys += ("diffusion_reasoning_convergence_stop",)
+        if delayed is not None:
+            keys += ("diffusion_reasoning_delayed_suffix_positions",)
+        if not any(key in extra for key in keys):
+            return
+        positions = extra.get("diffusion_reasoning_positions")
+        if (
+            not isinstance(positions, list)
+            or not positions
+            or any(
+                type(pos) is not int or not 0 <= pos < len(seed_canvas)
+                for pos in positions
+            )
+            or positions != sorted(set(positions))
+            or set(positions).intersection(answer_positions)
+        ):
+            raise VLLMValidationError(
+                "diffusion_reasoning_positions must be a nonempty, strictly "
+                "increasing list "
+                "of integer positions within the seed canvas, disjoint from "
+                "diffusion_answer_positions.",
+                parameter="diffusion_reasoning_positions",
+            )
+        if known is not None and (
+            not isinstance(known, list)
+            or not known
+            or any(
+                type(pos) is not int or not 0 <= pos < len(seed_canvas) for pos in known
+            )
+            or known != sorted(set(known))
+            or set(known).intersection((*positions, *answer_positions))
+        ):
+            raise VLLMValidationError(
+                "diffusion_reasoning_known_positions must be a nonempty, strictly "
+                "increasing list of integer positions within the seed canvas, "
+                "disjoint from reasoning and answer positions.",
+                parameter="diffusion_reasoning_known_positions",
+            )
+        if delayed is not None and (
+            not isinstance(delayed, list)
+            or not delayed
+            or any(
+                type(pos) is not int or not positions[-1] < pos < len(seed_canvas)
+                for pos in delayed
+            )
+            or delayed != sorted(set(delayed))
+            or set(delayed).intersection(answer_positions)
+        ):
+            raise VLLMValidationError(
+                "diffusion_reasoning_delayed_suffix_positions must be a nonempty, "
+                "strictly increasing list of integer positions within the seed "
+                "canvas, after all reasoning positions and disjoint from answer "
+                "positions.",
+                parameter="diffusion_reasoning_delayed_suffix_positions",
+            )
+        forbidden = extra.get("diffusion_reasoning_forbidden_token_ids")
+        if (
+            not isinstance(forbidden, list)
+            or any(
+                type(token) is not int or not 0 <= token < vocab_size
+                for token in forbidden
+            )
+            or len(set(forbidden)) != len(forbidden)
+            or len(forbidden) == vocab_size
+        ):
+            raise VLLMValidationError(
+                "diffusion_reasoning_forbidden_token_ids must be a list of unique "
+                "integer token IDs within the vocabulary and leave at least "
+                "one token available.",
+                parameter="diffusion_reasoning_forbidden_token_ids",
+            )
+        steps = extra.get("diffusion_reasoning_steps", 8)
+        if seed is not None and (type(seed) is not int or not 0 <= seed < 2**64):
+            raise VLLMValidationError(
+                "diffusion_reasoning_seed must be an unsigned 64-bit integer or null.",
+                parameter="diffusion_reasoning_seed",
+            )
+        for name in (
+            "diffusion_reasoning_round_feedback_logits",
+            "diffusion_reasoning_preserve_feedback",
+            "diffusion_reasoning_answer_feedback",
+            "diffusion_reasoning_unmasked_feedback",
+        ):
+            if name in extra and type(extra[name]) is not bool:
+                raise VLLMValidationError(f"{name} must be a boolean.", parameter=name)
+        if type(steps) is not int or not 1 <= steps <= 64:
+            raise VLLMValidationError(
+                "diffusion_reasoning_steps must be an integer between 1 and 64.",
+                parameter="diffusion_reasoning_steps",
+            )
+        schedule_steps = extra.get("diffusion_reasoning_schedule_steps", steps)
+        if type(schedule_steps) is not int or schedule_steps < steps:
+            raise VLLMValidationError(
+                "diffusion_reasoning_schedule_steps must be an integer at least "
+                "diffusion_reasoning_steps.",
+                parameter="diffusion_reasoning_schedule_steps",
+            )
+        if "diffusion_reasoning_entropy_bound" in extra:
+            bound = extra["diffusion_reasoning_entropy_bound"]
+            try:
+                valid_bound = (
+                    type(bound) in (int, float) and math.isfinite(bound) and bound >= 0
+                )
+            except OverflowError:
+                valid_bound = False
+            if not valid_bound:
+                raise VLLMValidationError(
+                    "diffusion_reasoning_entropy_bound must be a finite "
+                    "nonnegative number.",
+                    parameter="diffusion_reasoning_entropy_bound",
+                )
+        answer_noise = extra.get("diffusion_reasoning_answer_noise", "candidates")
+        if not isinstance(answer_noise, str) or answer_noise not in (
+            "candidates",
+            "vocab",
+        ):
+            raise VLLMValidationError(
+                "diffusion_reasoning_answer_noise must be 'candidates' or 'vocab'.",
+                parameter="diffusion_reasoning_answer_noise",
+            )
+        token_noise = extra.get("diffusion_reasoning_token_noise", "allowed")
+        if not isinstance(token_noise, str) or token_noise not in ("allowed", "vocab"):
+            raise VLLMValidationError(
+                "diffusion_reasoning_token_noise must be 'allowed' or 'vocab'.",
+                parameter="diffusion_reasoning_token_noise",
+            )
+        token_proposals = extra.get("diffusion_reasoning_token_proposals", "allowed")
+        if not isinstance(token_proposals, str) or token_proposals not in (
+            "allowed",
+            "vocab",
+        ):
+            raise VLLMValidationError(
+                "diffusion_reasoning_token_proposals must be 'allowed' or 'vocab'.",
+                parameter="diffusion_reasoning_token_proposals",
             )
 
     def _validate_structured_outputs(

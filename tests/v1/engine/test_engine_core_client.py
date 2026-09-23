@@ -11,10 +11,11 @@ import uuid
 from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import cache
 from threading import Thread
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -24,14 +25,20 @@ from tests.utils import multi_gpu_test
 from vllm import SamplingParams
 from vllm.distributed.kv_events import BlockStored, KVEventBatch, ZmqEventPublisher
 from vllm.engine.arg_utils import EngineArgs
+from vllm.exceptions import VLLMValidationError
 from vllm.platforms import current_platform
 from vllm.pooling_params import LateInteractionParams, PoolingParams
+from vllm.sampling_params import RequestOutputKind
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
+    EngineCoreRequestBatch,
+    EngineCoreRequestType,
+    UtilityOutput,
+    UtilityResult,
 )
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import (
@@ -40,13 +47,16 @@ from vllm.v1.engine.core_client import (
     EngineCoreClient,
     MPClient,
     SyncMPClient,
+    _process_utility_output,
 )
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.pool.late_interaction import (
     LATE_INTERACTION_MODE_CACHE_QUERY,
     LATE_INTERACTION_MODE_SCORE_DOC,
 )
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from ...distributed.conftest import MockSubscriber
 from ...utils import create_new_process_for_each_test
@@ -58,19 +68,22 @@ if not current_platform.is_cuda_alike():
     )
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 PROMPT = "Hello my name is Robert and I love quantization kernels"
-PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
 TEST_MODULE = "tests.v1.engine.test_engine_core_client"
 
 _REQUEST_COUNTER = 0
+
+
+@cache
+def _prompt_tokens() -> list[int]:
+    return AutoTokenizer.from_pretrained(MODEL_NAME)(PROMPT).input_ids
 
 
 def make_request(
     params: SamplingParams, prompt_tokens_ids: list[int] | None = None
 ) -> EngineCoreRequest:
     if not prompt_tokens_ids:
-        prompt_tokens_ids = PROMPT_TOKENS
+        prompt_tokens_ids = _prompt_tokens()
 
     global _REQUEST_COUNTER
     _REQUEST_COUNTER += 1
@@ -87,6 +100,455 @@ def make_request(
         cache_salt=None,
         data_parallel_rank=None,
     )
+
+
+def _batch_client():
+    client = object.__new__(AsyncMPClient)
+    client.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, tensor_parallel_size=1, pipeline_parallel_size=1
+        ),
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+    )
+    client.client_index = 3
+    client.core_engine = b"core"
+    client.encoder = MsgpackEncoder()
+    client.utility_results = {}
+    client.resources = SimpleNamespace(
+        output_queue_task=asyncio.get_running_loop().create_future()
+    )
+    client._batch_cleanup_tasks = set()
+    client._ensure_output_queue_task = MagicMock()
+    client._send_input_message = AsyncMock()
+    client.abort_requests_async = AsyncMock()
+    return client
+
+
+def _ack_batch(client, error=None):
+    call_id = next(iter(client.utility_results))
+    output = UtilityOutput(call_id, result=UtilityResult(error))
+    _process_utility_output(output, client.utility_results)
+    return output
+
+
+@pytest.mark.asyncio
+async def test_add_batch_serializes_all_children_and_waits_for_admission():
+    client = _batch_client()
+    requests = [
+        make_request(
+            SamplingParams(extra_args={"child": i}, logprob_token_ids=[i]), [1, 2]
+        )
+        for i in range(2)
+    ]
+    sent = asyncio.Event()
+    client._send_input_message.side_effect = lambda *_: sent.set()
+    task = asyncio.create_task(client.add_requests_async(requests))
+    await sent.wait()
+    assert not task.done()
+    message, engine = client._send_input_message.call_args.args
+    assert message[0] == EngineCoreRequestType.ADD_BATCH.value
+    assert engine == client.core_engine
+    batch = MsgpackDecoder(EngineCoreRequestBatch).decode(message[1:])
+    assert [r.request_id for r in batch.requests] == [r.request_id for r in requests]
+    assert all(r.client_index == 3 for r in batch.requests)
+    assert [r.sampling_params.extra_args for r in batch.requests] == [
+        {"child": 0},
+        {"child": 1},
+    ]
+    assert [r.sampling_params.logprob_token_ids for r in batch.requests] == [[0], [1]]
+    client._ensure_output_queue_task.assert_called_once()
+    _ack_batch(client)
+    await task
+    assert not client.utility_results
+    client.abort_requests_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("read_tp", [None, 2, 4])
+async def test_add_batch_rejection_and_cancellation_leave_no_submission_state(
+    cancel, read_tp, monkeypatch
+):
+    client = _batch_client()
+    requests = [make_request(SamplingParams(), [1, 2]) for _ in range(2)]
+    if read_tp is not None:
+        _configure_grouped_tp(client, monkeypatch, read_tp)
+        requests = _grouped_read_requests()
+    sent = asyncio.Event()
+    client._send_input_message.side_effect = lambda *_: sent.set()
+    task = asyncio.create_task(client.add_requests_async(requests))
+    await sent.wait()
+    if cancel:
+        task.cancel()
+    ack = _ack_batch(client, None if cancel else "Request ID collision")
+    with pytest.raises(asyncio.CancelledError if cancel else ValueError):
+        await task
+    if cancel:
+        client.abort_requests_async.assert_awaited_once_with(
+            [request.request_id for request in requests]
+        )
+    else:
+        client.abort_requests_async.assert_not_called()
+    assert not client.utility_results
+    _process_utility_output(ack, client.utility_results)
+
+
+@pytest.mark.asyncio
+async def test_add_batch_send_failure_cleans_up_waiter():
+    client = _batch_client()
+    client._send_input_message.side_effect = RuntimeError("send failed")
+    with pytest.raises(RuntimeError, match="send failed"):
+        await client.add_requests_async([make_request(SamplingParams(), [1, 2])])
+    assert not client.utility_results
+    client.abort_requests_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_add_batch_send_failure_after_admission_aborts_children():
+    client = _batch_client()
+    requests = [make_request(SamplingParams(), [1, 2])]
+
+    def admitted_then_failed(*_):
+        _ack_batch(client)
+        raise RuntimeError("send completion failed after admission")
+
+    client._send_input_message.side_effect = admitted_then_failed
+    with pytest.raises(RuntimeError, match="after admission"):
+        await client.add_requests_async(requests)
+    client.abort_requests_async.assert_awaited_once_with([requests[0].request_id])
+    assert not client.utility_results
+
+
+@pytest.mark.asyncio
+async def test_add_batch_engine_death_does_not_leave_ack_waiter():
+    client = _batch_client()
+    requests = [make_request(SamplingParams(), [1, 2])]
+    client._send_input_message.side_effect = lambda *_: (
+        client.resources.output_queue_task.set_result(None)
+    )
+    with pytest.raises(EngineDeadError):
+        await asyncio.wait_for(client.add_requests_async(requests), timeout=1)
+    assert not client.utility_results
+    client.abort_requests_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_add_batch_engine_death_releases_a_blocked_send():
+    client = _batch_client()
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def send(*_):
+        started.set()
+        await blocked.wait()
+
+    client._send_input_message.side_effect = send
+    task = asyncio.create_task(
+        client.add_requests_async([make_request(SamplingParams(), [1, 2])])
+    )
+    await started.wait()
+    client.resources.output_queue_task.set_result(None)
+    with pytest.raises(EngineDeadError):
+        await asyncio.wait_for(task, timeout=1)
+    assert not client.utility_results
+
+
+@pytest.mark.asyncio
+async def test_add_batch_repeated_cancellation_keeps_admission_cleanup_alive():
+    client = _batch_client()
+    requests = [make_request(SamplingParams(), [1, 2])]
+    sent = asyncio.Event()
+    client._send_input_message.side_effect = lambda *_: sent.set()
+    task = asyncio.create_task(client.add_requests_async(requests))
+    await sent.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.utility_results
+    _ack_batch(client)
+    await asyncio.gather(*client._batch_cleanup_tasks)
+    client.abort_requests_async.assert_awaited_once_with([requests[0].request_id])
+    assert not client.utility_results
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "empty",
+        "duplicate",
+        "dp",
+        "tp",
+        "pp",
+        "resumable",
+        "transfer",
+        "payload",
+        "sequence_limit",
+    ],
+)
+async def test_add_batch_rejects_unsupported_requests_before_send(invalid, monkeypatch):
+    client = _batch_client()
+    request = make_request(SamplingParams(), [1, 2])
+    requests = [request]
+    if invalid == "empty":
+        requests = []
+    elif invalid == "duplicate":
+        requests.append(request)
+    elif invalid in ("dp", "tp", "pp"):
+        name = {"dp": "data", "tp": "tensor", "pp": "pipeline"}[invalid]
+        setattr(client.vllm_config.parallel_config, f"{name}_parallel_size", 2)
+    elif invalid == "resumable":
+        request.resumable = True
+    elif invalid == "transfer":
+        request.sampling_params.extra_args = {"ec_transfer_params": {}}
+    elif invalid == "sequence_limit":
+        monkeypatch.setattr("vllm.envs.VLLM_MAX_N_SEQUENCES", 1)
+        requests.append(make_request(SamplingParams(), [1, 2]))
+    else:
+        monkeypatch.setattr("vllm.v1.engine.core_client.MAX_ENGINE_CORE_BATCH_BYTES", 1)
+    with pytest.raises(ValueError):
+        await client.add_requests_async(requests)
+    client._send_input_message.assert_not_called()
+    assert not client.utility_results
+
+
+def _configure_grouped_tp(client, monkeypatch, tp=2):
+    monkeypatch.delenv("VLLM_DIFFUSION_GROUPED_READ_TP", raising=False)
+    monkeypatch.delenv("VLLM_DIFFUSION_GROUPED_READ_TP4", raising=False)
+    monkeypatch.setenv(
+        "VLLM_DIFFUSION_GROUPED_READ_TP"
+        if tp == 2
+        else "VLLM_DIFFUSION_GROUPED_READ_TP4",
+        "1",
+    )
+    config = client.vllm_config
+    config.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        tensor_parallel_size=tp,
+        pipeline_parallel_size=1,
+        enable_expert_parallel=False,
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+        enable_batch_sharded_sampling=False,
+    )
+    config.model_config = SimpleNamespace(
+        is_diffusion=True,
+        architectures=["DiffusionGemmaForBlockDiffusion"],
+        architecture="DiffusionGemmaForBlockDiffusion",
+        hf_config=SimpleNamespace(model_type="diffusion_gemma"),
+    )
+    config.diffusion_config = SimpleNamespace(canvas_length=4)
+    config.use_v2_model_runner = True
+
+
+def _grouped_read_requests():
+    return [
+        make_request(
+            SamplingParams(
+                max_tokens=4,
+                output_kind=RequestOutputKind.FINAL_ONLY,
+                logprobs=0,
+                logprob_token_ids=[1, 2],
+                extra_args={
+                    "diffusion_read_only": True,
+                    "diffusion_seed_canvas": [1, 1, 1, 1],
+                    "diffusion_answer_positions": [1],
+                },
+            ),
+            [1, 2],
+        )
+        for _ in range(2)
+    ]
+
+
+def _validate_grouped_frontend(config, requests, prompt):
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    AsyncLLM._validate_child_sampling_params(
+        SimpleNamespace(vllm_config=config),
+        SamplingParams(n=2, output_kind=RequestOutputKind.FINAL_ONLY),
+        [request.sampling_params for request in requests],
+        prompt,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("mode", ["tp_reads", "default_tp1", "flagged_tp1"])
+async def test_grouped_tp_opt_in_preserves_atomic_admission(mode, monkeypatch, tp):
+    client = _batch_client()
+    _configure_grouped_tp(client, monkeypatch, tp)
+    requests = _grouped_read_requests()
+    if mode != "tp_reads":
+        client.vllm_config.parallel_config.tensor_parallel_size = 1
+        client.vllm_config.model_config = None
+        for request in requests:
+            request.sampling_params.extra_args = None
+        if mode == "default_tp1":
+            monkeypatch.delenv(
+                "VLLM_DIFFUSION_GROUPED_READ_TP"
+                if tp == 2
+                else "VLLM_DIFFUSION_GROUPED_READ_TP4"
+            )
+    _validate_grouped_frontend(client.vllm_config, requests, requests[0])
+    sent = asyncio.Event()
+    client._send_input_message.side_effect = lambda *_: sent.set()
+    task = asyncio.create_task(client.add_requests_async(requests))
+    await asyncio.wait_for(sent.wait(), timeout=1)
+    assert not task.done()
+    message, engine = client._send_input_message.call_args.args
+    assert message[0] == EngineCoreRequestType.ADD_BATCH.value
+    assert engine == client.core_engine
+    batch = MsgpackDecoder(EngineCoreRequestBatch).decode(message[1:])
+    assert [request.request_id for request in batch.requests] == [
+        request.request_id for request in requests
+    ]
+    _ack_batch(client)
+    await task
+    client.abort_requests_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("flag", None),
+        ("flag", "0"),
+        ("flag", "true"),
+        ("parallel_config.tensor_parallel_size", 8),
+        ("parallel_config.data_parallel_size", 2),
+        ("parallel_config.pipeline_parallel_size", 2),
+        ("parallel_config.enable_expert_parallel", True),
+        ("parallel_config.decode_context_parallel_size", 2),
+        ("parallel_config.prefill_context_parallel_size", 2),
+        ("parallel_config.enable_batch_sharded_sampling", True),
+        ("model_config.hf_config.model_type", "other_diffusion"),
+        ("model_config.architectures", ["OtherDiffusionModel"]),
+        ("model_config.architecture", "TransformersForCausalLM"),
+        ("model_config.is_diffusion", False),
+        ("model_config", None),
+        ("diffusion_config", None),
+        ("use_v2_model_runner", False),
+        ("read_only", False),
+        ("read_only", 1),
+        ("child.mm_features", [object()]),
+        ("child.prompt_embeds", object()),
+        ("child.prompt_is_token_ids", [True, False]),
+        ("child.prompt_token_ids", None),
+        ("kv_transfer_config", object()),
+        ("ec_transfer_config", object()),
+        ("child.session_id", "session"),
+        ("child.resumable", True),
+    ],
+)
+@pytest.mark.parametrize("tp", [2, 4])
+async def test_grouped_tp_rejects_unsupported_paths_before_send(
+    field, value, monkeypatch, tp
+):
+    client = _batch_client()
+    _configure_grouped_tp(client, monkeypatch, tp)
+    requests = _grouped_read_requests()
+    if field == "flag":
+        flag = (
+            "VLLM_DIFFUSION_GROUPED_READ_TP"
+            if tp == 2
+            else "VLLM_DIFFUSION_GROUPED_READ_TP4"
+        )
+        if value is None:
+            monkeypatch.delenv(flag)
+        else:
+            monkeypatch.setenv(flag, value)
+    elif field == "read_only":
+        requests[1].sampling_params.extra_args["diffusion_read_only"] = value
+    else:
+        target = client.vllm_config
+        if field.startswith("child."):
+            target, field = requests[1], field.removeprefix("child.")
+        *parents, attribute = field.split(".")
+        for parent in parents:
+            target = getattr(target, parent)
+        setattr(target, attribute, value)
+    with pytest.raises(VLLMValidationError):
+        _validate_grouped_frontend(client.vllm_config, requests, requests[1])
+    with pytest.raises(ValueError):
+        await client.add_requests_async(requests)
+    client._send_input_message.assert_not_called()
+    assert not client.utility_results
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt,accepted",
+    [
+        ("text", True),
+        ([1, 2], True),
+        ({"prompt": "text"}, True),
+        ({"prompt_token_ids": [1, 2]}, True),
+        ({"type": "token", "prompt_token_ids": [1, 2]}, True),
+        ({"type": "multimodal", "prompt_token_ids": [1, 2]}, False),
+        ({"type": "embeds", "prompt_embeds": None}, False),
+        ({"prompt": "text", "multi_modal_data": {"image": None}}, False),
+        ({"prompt": "text", "multi_modal_uuids": {"image": "cached"}}, False),
+        ({"encoder_prompt": "text", "decoder_prompt": None}, False),
+    ],
+)
+@pytest.mark.parametrize("tp", [2, 4])
+async def test_grouped_tp_frontend_accepts_only_text_prompts(
+    prompt, accepted, monkeypatch, tp
+):
+    client = _batch_client()
+    _configure_grouped_tp(client, monkeypatch, tp)
+    requests = _grouped_read_requests()
+    if accepted:
+        _validate_grouped_frontend(client.vllm_config, requests, prompt)
+    else:
+        with pytest.raises(VLLMValidationError):
+            _validate_grouped_frontend(client.vllm_config, requests, prompt)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tp,old_flag,new_flag,accepted",
+    [
+        (2, "1", "0", True),
+        (2, "0", "1", False),
+        (4, "1", "0", False),
+        (4, "0", "1", True),
+        (4, "1", "1", True),
+        (8, "1", "1", False),
+        (1, "0", "1", True),
+        (1, "1", "1", True),
+    ],
+)
+async def test_grouped_tp_flags_are_independent(
+    tp, old_flag, new_flag, accepted, monkeypatch
+):
+    client = _batch_client()
+    _configure_grouped_tp(client, monkeypatch, tp)
+    monkeypatch.setenv("VLLM_DIFFUSION_GROUPED_READ_TP", old_flag)
+    monkeypatch.setenv("VLLM_DIFFUSION_GROUPED_READ_TP4", new_flag)
+    requests = _grouped_read_requests()
+    if tp == 1:
+        client.vllm_config.model_config = None
+        for request in requests:
+            request.sampling_params.extra_args = None
+
+    def validate():
+        _validate_grouped_frontend(client.vllm_config, requests, requests[0])
+
+    batch = EngineCoreRequestBatch(call_id=1, client_index=0, requests=requests)
+    if accepted:
+        validate()
+        batch.validate(client.vllm_config)
+    else:
+        with pytest.raises(VLLMValidationError):
+            validate()
+        with pytest.raises(ValueError):
+            batch.validate(client.vllm_config)
 
 
 def _reload_envs_module():

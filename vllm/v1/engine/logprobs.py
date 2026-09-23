@@ -82,6 +82,33 @@ class LogprobsProcessor:
 
         token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists
 
+        if isinstance(self.logprobs, FlatLogprobs) and self.tokenizer is None:
+            width = logprobs_lst.shape[1]
+            if self.num_logprobs != -1:
+                width = min(width, self.num_logprobs + 1)
+            num_positions = logprobs_lst.shape[0]
+            offset = len(self.logprobs.logprobs)
+            self.logprobs.start_indices.extend(
+                range(offset, offset + num_positions * width, width)
+            )
+            self.logprobs.end_indices.extend(
+                range(offset + width, offset + (num_positions + 1) * width, width)
+            )
+            self.logprobs.token_ids.extend(
+                token_ids_lst[:, :width].reshape(-1).tolist()
+            )
+            self.logprobs.logprobs.extend(logprobs_lst[:, :width].reshape(-1).tolist())
+            topk_ranks = tuple(range(1, width))
+            for rank in ranks_lst.tolist():
+                self.logprobs.ranks.append(rank)
+                self.logprobs.ranks.extend(topk_ranks)
+            self.logprobs.decoded_tokens.extend(
+                itertools.repeat(None, num_positions * width)
+            )
+            for sampled_logprob in logprobs_lst[:, 0].tolist():
+                self.cumulative_logprob += sampled_logprob
+            return
+
         for rank_np, logprobs_np, token_ids_np in zip(
             ranks_lst, logprobs_lst, token_ids_lst
         ):

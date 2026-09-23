@@ -38,10 +38,12 @@ from vllm.utils.network_utils import (
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     FT_STATUS_CALL_ID,
+    MAX_ENGINE_CORE_BATCH_BYTES,
     EEPNotificationType,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
+    EngineCoreRequestBatch,
     EngineCoreRequestType,
     PauseMode,
     ReconfigureDistributedRequest,
@@ -265,6 +267,9 @@ class EngineCoreClient(ABC):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
+
+    async def add_requests_async(self, requests: list[EngineCoreRequest]) -> None:
+        raise ValueError("This engine client does not support batch admission.")
 
     async def profile_async(
         self, is_start: bool = True, profile_prefix: str | None = None
@@ -856,7 +861,10 @@ def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
     """Set the result from a utility method in the waiting future."""
-    future = utility_results.pop(output.call_id)
+    future = utility_results.pop(output.call_id, None)
+    if future is None:
+        # A cancelled batch submission may have already discarded its waiter.
+        return
     failure_message = output.failure_message
     try:
         if failure_message is not None:
@@ -1077,6 +1085,7 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+        self._batch_cleanup_tasks: set[asyncio.Task[None]] = set()
 
         # locally-cached engine status
         self._engine_status: dict[int, dict] = {}
@@ -1228,6 +1237,92 @@ class AsyncMPClient(MPClient):
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
+
+    async def add_requests_async(self, requests: list[EngineCoreRequest]) -> None:
+        """Admit every child before any can be scheduled, or reject the batch."""
+        if isinstance(self, DPAsyncMPClient):
+            raise ValueError("Data-parallel clients do not support batch admission.")
+        for request in requests:
+            request.client_index = self.client_index
+        call_id = uuid.uuid4().int >> 64
+        batch = EngineCoreRequestBatch(call_id, self.client_index, requests)
+        batch.validate(self.vllm_config)
+        frames = self.encoder.encode(batch)
+        size = sum(
+            frame.nbytes if isinstance(frame, memoryview) else len(frame)
+            for frame in frames
+        )
+        if size > MAX_ENGINE_CORE_BATCH_BYTES:
+            raise ValueError("Request batch exceeds the transport payload limit.")
+
+        self._ensure_output_queue_task()
+        reader = self.resources.output_queue_task
+        assert reader is not None
+        future = asyncio.get_running_loop().create_future()
+        self.utility_results[call_id] = future
+        send: asyncio.Future[Any] | None = None
+        cleanup_started = False
+
+        def reader_stopped(_):
+            if not future.done():
+                future.set_exception(EngineDeadError())
+            if send is not None and not send.done():
+                send.cancel()
+
+        def retire():
+            reader.remove_done_callback(reader_stopped)
+            self.utility_results.pop(call_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
+
+        async def cleanup():
+            try:
+                if not future.done():
+                    if send is None:
+                        return
+                    try:
+                        await send
+                    except Exception:
+                        if not future.done():
+                            return
+                if await future is None:
+                    await self.abort_requests_async(
+                        [request.request_id for request in requests]
+                    )
+            except (Exception, asyncio.CancelledError):
+                logger.debug("Batch submission cleanup failed", exc_info=True)
+            finally:
+                retire()
+
+        reader.add_done_callback(reader_stopped)
+        try:
+            send = asyncio.ensure_future(
+                self._send_input_message(
+                    (EngineCoreRequestType.ADD_BATCH.value, *frames), self.core_engine
+                )
+            )
+            await asyncio.shield(send)
+            error = await asyncio.shield(future)
+            if error is not None:
+                raise ValueError(error)
+        except BaseException as error:
+            # Do not abort colliding IDs in a rejected batch. If cancellation
+            # races admission, first learn whether these children were inserted.
+            # Keep cleanup alive even if the caller is cancelled a second time.
+            cleanup_started = True
+            task = asyncio.create_task(cleanup(), name="EngineCoreBatchCleanup")
+            self._batch_cleanup_tasks.add(task)
+            task.add_done_callback(self._batch_cleanup_tasks.discard)
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(task)
+            if isinstance(error, asyncio.CancelledError) and reader.done():
+                raise EngineDeadError() from error
+            raise
+        finally:
+            if not cleanup_started:
+                retire()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:

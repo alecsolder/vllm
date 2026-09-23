@@ -61,6 +61,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.models.diffusion_gemma_text_norm import (
+    fused_feedforward_inputs,
+    fused_feedforward_output,
+    fused_qkv_norm,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
@@ -393,6 +398,7 @@ class Gemma4Attention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = hidden_size
+        self.use_fused_batch_invariant_norm = False
 
         tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -550,20 +556,30 @@ class Gemma4Attention(nn.Module):
             # For k_eq_v, K weights are loaded into both K and V slots of
             # qkv_proj, so V == K automatically.
             qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-            q = q.unflatten(-1, (self.num_heads, self.head_dim))
-            q = self.q_norm(q)
-            q = q.flatten(-2, -1)
-
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
-
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
+            if (
+                self.use_fused_batch_invariant_norm
+                and qkv.dtype == torch.bfloat16
+                and qkv.is_contiguous()
+            ):
+                q, k, v = fused_qkv_norm(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                )
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q = self.q_norm(q.unflatten(-1, (self.num_heads, self.head_dim)))
+                q = q.flatten(-2, -1)
+                k = self.k_norm(k.unflatten(-1, (self.num_kv_heads, self.head_dim)))
+                k = k.flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
+                v = self.v_norm(v.unflatten(-1, (self.num_kv_heads, self.head_dim)))
+                v = v.flatten(-2, -1)
             attn_output = self.attn(q, k, v)
 
         output, _ = self.o_proj(attn_output)
@@ -581,6 +597,7 @@ class Gemma4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.use_fused_batch_invariant_norm = False
         self.hidden_size_per_layer_input = getattr(
             config, "hidden_size_per_layer_input", 0
         )
@@ -738,6 +755,41 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
         residual = hidden_states
+
+        if (
+            self.use_fused_batch_invariant_norm
+            and per_layer_input is None
+            and residual.dtype == torch.bfloat16
+            and residual.is_contiguous()
+        ):
+            assert self.pre_feedforward_layernorm_2 is not None
+            assert self.post_feedforward_layernorm_1 is not None
+            assert self.post_feedforward_layernorm_2 is not None
+            assert self.router is not None and self.moe is not None
+            dense_input, expert_input, router_input = fused_feedforward_inputs(
+                residual,
+                self.pre_feedforward_layernorm.weight,
+                self.pre_feedforward_layernorm_2.weight,
+                self.router.scale,
+                self.router.root_size,
+                self.pre_feedforward_layernorm.variance_epsilon,
+            )
+            dense = self.mlp(dense_input)
+            router_logits, _ = self.router.proj(router_input)
+            expert = self.moe(expert_input, router_logits)
+            hidden_states = fused_feedforward_output(
+                dense,
+                expert,
+                residual,
+                self.post_feedforward_layernorm_1.weight,
+                self.post_feedforward_layernorm_2.weight,
+                self.post_feedforward_layernorm.weight,
+                self.layer_scalar,
+                self.post_feedforward_layernorm_1.variance_epsilon,
+                self.post_feedforward_layernorm_2.variance_epsilon,
+                self.post_feedforward_layernorm.variance_epsilon,
+            )
+            return hidden_states, None
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
         hidden_states = self.pre_feedforward_layernorm(hidden_states)

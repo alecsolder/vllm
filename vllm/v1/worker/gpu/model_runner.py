@@ -1523,9 +1523,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
+            prepare_sample_hidden_states = getattr(
+                self.sampler, "prepare_sample_hidden_states", None
+            )
+            if prepare_sample_hidden_states is not None:
+                sample_hidden_states = prepare_sample_hidden_states(
+                    sample_hidden_states, input_batch
+                )
+            logits = (
+                self.model.compute_logits(sample_hidden_states)
+                if sample_hidden_states.shape[0] > 0
+                else sample_hidden_states.new_empty((0, self.vocab_size))
+            )
 
-        if grammar_output is not None:
+        if grammar_output is not None and logits.shape[0] > 0:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
             self.structured_outputs_worker.apply_grammar_bitmask(

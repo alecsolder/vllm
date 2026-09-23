@@ -6,7 +6,12 @@
 import time
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import (
+    Field,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+    model_validator,
+)
 
 import vllm.envs as envs
 from vllm.config import ModelConfig
@@ -261,6 +266,143 @@ class CompletionRequest(OpenAIBaseModel):
     )
 
     # --8<-- [end:completion-extra-params]
+
+    @field_validator("vllm_xargs", mode="before")
+    @classmethod
+    def reject_answer_pass_aggregation(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "diffusion_answer_pass_aggregation" in value:
+            raise VLLMValidationError(
+                "answer_pass_aggregation requires chat diffusion_reads.",
+                parameter="vllm_xargs.diffusion_answer_pass_aggregation",
+            )
+        return value
+
+    @field_validator("vllm_xargs", mode="before")
+    @classmethod
+    def validate_reasoning_token_noise(cls, value: Any) -> Any:
+        name = "diffusion_reasoning_token_noise"
+        if (
+            isinstance(value, dict)
+            and name in value
+            and (
+                type(value[name]) is not str or value[name] not in ("allowed", "vocab")
+            )
+        ):
+            raise VLLMValidationError(
+                f"{name} must be 'allowed' or 'vocab'.",
+                parameter=f"vllm_xargs.{name}",
+            )
+        return value
+
+    @field_validator("vllm_xargs", mode="before")
+    @classmethod
+    def validate_reasoning_token_proposals(cls, value: Any) -> Any:
+        name = "diffusion_reasoning_token_proposals"
+        if (
+            isinstance(value, dict)
+            and name in value
+            and (
+                type(value[name]) is not str or value[name] not in ("allowed", "vocab")
+            )
+        ):
+            raise VLLMValidationError(
+                f"{name} must be 'allowed' or 'vocab'.",
+                parameter=f"vllm_xargs.{name}",
+            )
+        return value
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_convergence_stop(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_convergence_stop"
+        if not isinstance(value, dict) or name not in value:
+            return handler(value)
+        if type(value[name]) is not bool:
+            raise VLLMValidationError(
+                f"{name} must be a boolean.", parameter=f"vllm_xargs.{name}"
+            )
+        parsed = handler(value)
+        parsed[name] = value[name]
+        return parsed
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_unmasked_feedback(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_unmasked_feedback"
+        if not isinstance(value, dict) or name not in value:
+            return handler(value)
+        if type(value[name]) is not bool:
+            raise VLLMValidationError(
+                f"{name} must be a boolean.", parameter=f"vllm_xargs.{name}"
+            )
+        parsed = handler(value)
+        parsed[name] = value[name]
+        return parsed
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_known_positions(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_known_positions"
+        if isinstance(value, dict) and name in value:
+            positions = value[name]
+            if positions is None:
+                return handler(
+                    {key: item for key, item in value.items() if key != name}
+                )
+            if not isinstance(positions, list) or any(
+                type(pos) is not int for pos in positions
+            ):
+                raise VLLMValidationError(
+                    f"{name} must be a list of integer positions or null.",
+                    parameter=f"vllm_xargs.{name}",
+                )
+        return handler(value)
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_delayed_suffix_positions(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_delayed_suffix_positions"
+        if isinstance(value, dict) and name in value:
+            positions = value[name]
+            if positions is None:
+                return handler(
+                    {key: item for key, item in value.items() if key != name}
+                )
+            if not isinstance(positions, list) or any(
+                type(pos) is not int for pos in positions
+            ):
+                raise VLLMValidationError(
+                    f"{name} must be a list of integer positions or null.",
+                    parameter=f"vllm_xargs.{name}",
+                )
+        return handler(value)
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_seed(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_seed"
+        if isinstance(value, dict) and name in value:
+            seed = value[name]
+            if seed is None:
+                return handler(
+                    {key: item for key, item in value.items() if key != name}
+                )
+            if type(seed) is not int or not 0 <= seed < 2**64:
+                raise VLLMValidationError(
+                    f"{name} must be an unsigned 64-bit integer or null.",
+                    parameter=f"vllm_xargs.{name}",
+                )
+        return handler(value)
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         return TokenizeParams(

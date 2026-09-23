@@ -75,8 +75,10 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if envs.VLLM_BATCH_INVARIANT and (
-            current_platform.is_cuda_alike() or current_platform.is_xpu()
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and not envs.VLLM_BATCH_INVARIANT_FAST_LINEAR
+            and (current_platform.is_cuda_alike() or current_platform.is_xpu())
         ):
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)

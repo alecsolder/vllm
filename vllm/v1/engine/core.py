@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -59,11 +60,13 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
+    MAX_ENGINE_CORE_BATCH_BYTES,
     EEPNotificationType,
     EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
+    EngineCoreRequestBatch,
     EngineCoreRequestType,
     FinishReason,
     PauseMode,
@@ -100,6 +103,14 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+@dataclass
+class PreparedRequestBatch:
+    batch: EngineCoreRequestBatch
+    requests: list[tuple[Request, int]]
+    error: str | None = None
+    mm_cache_miss_hashes: list[str] | None = None
 
 
 class EngineCore:
@@ -1550,6 +1561,8 @@ class EngineCoreProc(EngineCore):
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
+        elif request_type == EngineCoreRequestType.ADD_BATCH:
+            self._handle_request_batch(request)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1572,6 +1585,103 @@ class EngineCoreProc(EngineCore):
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
             )
+
+    def _preprocess_request_batch(
+        self, batch: EngineCoreRequestBatch, payload_size: int
+    ) -> PreparedRequestBatch:
+        """Prepare all children on the MM receiver cache's owning input thread."""
+        prepared = PreparedRequestBatch(batch, [])
+        try:
+            batch.validate(self.vllm_config)
+            if payload_size > MAX_ENGINE_CORE_BATCH_BYTES:
+                raise ValueError("Request batch exceeds the transport payload limit.")
+        except ValueError as error:
+            prepared.error = str(error)
+            return prepared
+        missing: set[str] = set()
+        for request in batch.requests:
+            try:
+                prepared.requests.append(self.preprocess_add_request(request))
+            except MultiModalCacheMissError as error:
+                missing.update(error.mm_hashes)
+            except Exception:
+                logger.exception("Failed to preprocess request batch")
+                prepared.error = "Failed to preprocess request batch."
+                break
+        if missing:
+            prepared.error = "Request batch has a multi-modal receiver cache miss."
+            prepared.mm_cache_miss_hashes = sorted(missing)
+        return prepared
+
+    def _handle_request_batch(self, prepared: PreparedRequestBatch) -> None:
+        """Insert a whole prepared batch before returning to the engine step."""
+        batch = prepared.batch
+        requests_by_id = getattr(self.scheduler, "requests", None)
+        if not isinstance(requests_by_id, dict):
+            ack = UtilityOutput(
+                batch.call_id,
+                result=UtilityResult("Scheduler does not support batch admission."),
+            )
+            self.output_queue.put_nowait(
+                (batch.client_index, EngineCoreOutputs(utility_output=ack))
+            )
+            return
+        collisions = {
+            request.request_id
+            for request in batch.requests
+            if request.request_id in requests_by_id
+        }
+        error = prepared.error
+        if collisions:
+            error = "Request batch contains an existing request ID."
+        elif self.shutdown_state != EngineShutdownState.RUNNING:
+            error = "Server shutting down."
+        if error is None:
+            try:
+                for request, request_wave in prepared.requests:
+                    self.add_request(request, request_wave)
+            except Exception:
+                logger.exception("Failed to admit request batch")
+                error = "Failed to admit request batch."
+                # An add can fail after insertion; identity also catches that
+                # member without ever aborting an unrelated colliding request.
+                self.abort_requests(
+                    [
+                        request.request_id
+                        for request, _ in prepared.requests
+                        if requests_by_id.get(request.request_id) is request
+                    ]
+                )
+        if error is not None:
+            seen: set[str] = set()
+            outputs = []
+            for request in batch.requests:
+                request_id = request.request_id
+                if request_id in collisions or request_id in seen:
+                    continue
+                seen.add(request_id)
+                outputs.append(
+                    EngineCoreOutput(
+                        request_id,
+                        [],
+                        finish_reason=FinishReason.ERROR,
+                        mm_cache_miss_hashes=prepared.mm_cache_miss_hashes,
+                    )
+                )
+            if outputs:
+                self.output_queue.put_nowait(
+                    (
+                        batch.client_index,
+                        EngineCoreOutputs(outputs=outputs, finished_requests=seen),
+                    )
+                )
+        # Use only the result correlation channel, not utility RPC dispatch.
+        # Error results raise in the caller, including collisions for which an
+        # ordinary terminal output would corrupt the pre-existing request.
+        ack = UtilityOutput(batch.call_id, result=UtilityResult(error))
+        self.output_queue.put_nowait(
+            (batch.client_index, EngineCoreOutputs(utility_output=ack))
+        )
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -1708,6 +1818,9 @@ class EngineCoreProc(EngineCore):
         add_request_decoder = MsgpackDecoder(
             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
         )
+        add_batch_decoder = MsgpackDecoder(
+            EngineCoreRequestBatch, oob_tensor_provider=self.tensor_ipc_receiver
+        )
         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -1777,6 +1890,11 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                    elif request_type == EngineCoreRequestType.ADD_BATCH:
+                        batch = add_batch_decoder.decode(data_frames)
+                        request = self._preprocess_request_batch(
+                            batch, sum(len(frame) for frame in data_frames)
+                        )
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
                         client_idx, call_id, method, args = request

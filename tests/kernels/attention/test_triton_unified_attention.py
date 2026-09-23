@@ -233,6 +233,160 @@ def ref_paged_clamped_mm_attn(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("sliding_window", [None, 1024])
+@pytest.mark.parametrize("prompt_tail,canvas_len", [(13, 256), (0, 256), (13, 0)])
+def test_fused_causal_prompt_and_bidirectional_canvas_match_separate_forwards(
+    sliding_window,
+    prompt_tail,
+    canvas_len,
+):
+    """Logical sequence boundaries preserve the original attention arithmetic."""
+    set_random_seed(0)
+    prompt_len = 1097
+    total_len = prompt_len + canvas_len
+    block_size, heads, kv_heads, head_size = 16, 4, 2, 128
+    blocks = (total_len + block_size - 1) // block_size
+    query = torch.randn(
+        prompt_tail + canvas_len,
+        heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=DEVICE_TYPE,
+    )
+    key = torch.randn(
+        blocks,
+        block_size,
+        kv_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=DEVICE_TYPE,
+    )
+    value = torch.randn_like(key)
+    block_table = torch.arange(blocks, dtype=torch.int32, device=DEVICE_TYPE)[None]
+
+    def attend(q, seq_lens, query_lens, causal):
+        out = torch.empty_like(q)
+        if not q.shape[0]:
+            return out
+        unified_attention(
+            q=q,
+            k=key,
+            v=value,
+            out=out,
+            cu_seqlens_q=torch.tensor(
+                [0, *query_lens], dtype=torch.int32, device=DEVICE_TYPE
+            ).cumsum(0, dtype=torch.int32),
+            max_seqlen_q=max(query_lens),
+            seqused_k=torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE_TYPE),
+            max_seqlen_k=max(seq_lens),
+            softmax_scale=head_size**-0.5,
+            causal=torch.tensor(causal, dtype=torch.bool, device=DEVICE_TYPE),
+            window_size=(-1, -1) if sliding_window is None else (sliding_window - 1, 0),
+            block_table=block_table.expand(len(seq_lens), -1).contiguous(),
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+        )
+        return out
+
+    expected = torch.cat(
+        [
+            attend(query[:prompt_tail], [prompt_len], [prompt_tail], [True]),
+            attend(query[prompt_tail:], [total_len], [canvas_len], [False]),
+        ]
+    )
+    actual = attend(
+        query, [prompt_len, total_len], [prompt_tail, canvas_len], [True, False]
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("prompt_tail", [0, 25])
+def test_wider_query_tiles_preserve_negative_logit_swa_rounding(
+    monkeypatch, prompt_tail
+):
+    """An extra masked tile must preserve the original online-softmax state."""
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(90):
+        pytest.skip("The H200 query-tile profile requires SM90")
+    from vllm.v1.attention.ops import triton_unified_attention as attention
+
+    set_random_seed(0)
+    canvas, prefix, block_size = 1024, 89, 16
+    query = (
+        torch.randn(
+            prompt_tail + canvas, 4, 256, dtype=torch.bfloat16, device=DEVICE_TYPE
+        )
+        * 0.02
+        + 0.125
+    )
+    key = (
+        torch.randn(
+            triton.cdiv(prefix + canvas, block_size),
+            block_size,
+            2,
+            256,
+            dtype=torch.bfloat16,
+            device=DEVICE_TYPE,
+        )
+        * 0.02
+        - 0.125
+    )
+    value = torch.randn_like(key)
+    table = torch.arange(key.shape[0], dtype=torch.int32, device=DEVICE_TYPE)
+    kernel = attention.kernel_unified_attention
+
+    def attend(block_m, canonical_block_q):
+        class QueryTileLaunch:
+            def __getitem__(self, grid):
+                def run(**kwargs):
+                    kwargs.update(
+                        BLOCK_M=block_m,
+                        BLOCK_Q=block_m // 2,
+                        CANONICAL_BLOCK_Q=canonical_block_q,
+                        TILE_SIZE=32,
+                        num_warps=4,
+                        num_stages=2,
+                    )
+                    return kernel[(query.shape[0] // (block_m // 2) + 2, 2)](**kwargs)
+
+                return run
+
+        monkeypatch.setattr(attention, "kernel_unified_attention", QueryTileLaunch())
+        output = torch.empty_like(query)
+        attention.unified_attention(
+            q=query,
+            k=key,
+            v=value,
+            out=output,
+            cu_seqlens_q=torch.tensor(
+                [0, prompt_tail, prompt_tail + canvas],
+                dtype=torch.int32,
+                device=DEVICE_TYPE,
+            ),
+            max_seqlen_q=canvas,
+            seqused_k=torch.tensor(
+                [prefix, prefix + canvas], dtype=torch.int32, device=DEVICE_TYPE
+            ),
+            max_seqlen_k=prefix + canvas,
+            softmax_scale=1.0,
+            causal=torch.tensor([True, False], device=DEVICE_TYPE),
+            window_size=(1023, 1023),
+            block_table=table.expand(2, -1).contiguous(),
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+        )
+        return output
+
+    baseline = attend(16, 0)
+    wider = attend(32, 8)
+    torch.testing.assert_close(wider, baseline, atol=0, rtol=0)
+
+
+@torch.inference_mode()
 def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
     set_random_seed(0)
     query_lens = [384, 96]

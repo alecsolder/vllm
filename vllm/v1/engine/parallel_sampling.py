@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from copy import copy
+from collections.abc import Sequence
+from copy import copy, deepcopy
 from typing import cast
 
 from vllm.outputs import CompletionOutput
@@ -33,7 +34,11 @@ class ParentRequest:
     # To efficiently obtain child sampling params
     cached_child_sampling_params: SamplingParams | None
 
-    def __init__(self, request: EngineCoreRequest) -> None:
+    def __init__(
+        self,
+        request: EngineCoreRequest,
+        child_sampling_params: Sequence[SamplingParams] | None = None,
+    ) -> None:
         assert request.external_req_id is not None
         sampling_params = request.params
         self.request_id = request.request_id
@@ -48,6 +53,18 @@ class ParentRequest:
         )
         self.max_num_generation_tokens = 0
         self.cached_child_sampling_params = None
+        self.prepared_child_sampling_params = None
+        if child_sampling_params is not None:
+            if len(child_sampling_params) != sampling_params.n or any(
+                child.n != 1 for child in child_sampling_params
+            ):
+                raise ValueError("Expected n child sampling parameters with n=1.")
+            self.prepared_child_sampling_params = tuple(
+                deepcopy(child) for child in child_sampling_params
+            )
+            self.child_requests = {
+                f"{index}_{self.request_id}" for index in range(sampling_params.n)
+            }
 
     def _get_child_sampling_params(
         self,
@@ -66,6 +83,8 @@ class ParentRequest:
           Child `sampling_params` instance.
 
         """
+        if self.prepared_child_sampling_params is not None:
+            return self.prepared_child_sampling_params[index]
         seed = self.sampling_params.seed
         if self.cached_child_sampling_params:
             # Reuse child sampling_params data structure
@@ -92,7 +111,8 @@ class ParentRequest:
 
         """
         child_req_id = f"{index}_{self.request_id}"
-        self.child_requests.add(child_req_id)
+        if self.prepared_child_sampling_params is None:
+            self.child_requests.add(child_req_id)
         return child_req_id, self._get_child_sampling_params(index)
 
     @property

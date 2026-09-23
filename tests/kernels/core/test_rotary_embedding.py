@@ -4,9 +4,19 @@
 
 import pytest
 import torch
+from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4VisionAttention,
+    apply_multidimensional_rope,
+)
 
 from tests.kernels.utils import opcheck
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.models.diffusion_gemma_vision_rope import (
+    diffusion_gemma_vision_qk_rope,
+    diffusion_gemma_vision_rope,
+    replace_diffusion_gemma_vision_attentions,
+)
 
 
 def rotary_embedding_opcheck(
@@ -75,3 +85,147 @@ def test_rotary_embedding_opcheck(
             query.flatten(start_dim=-2),
             key.flatten(start_dim=-2) if key is not None else None,
         )
+
+
+@pytest.mark.parametrize("seq_len", [630, 1260, 2520])
+@torch.inference_mode()
+def test_diffusion_gemma_vision_rope_exact(seq_len: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260917 + seq_len)
+    value = torch.randn(
+        1,
+        seq_len,
+        16,
+        72,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    cosine = torch.randn(
+        1,
+        seq_len,
+        72,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    sine = torch.randn(
+        1,
+        seq_len,
+        72,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    position_ids = torch.zeros(1, seq_len, 2, dtype=torch.long, device=device)
+
+    expected = apply_multidimensional_rope(
+        value, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    actual = diffusion_gemma_vision_rope(
+        value, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "seq_len", "num_heads", "head_dim"),
+    [(1, 1, 1, 4), (2, 7, 3, 8), (1, 2520, 16, 72)],
+)
+@torch.inference_mode()
+def test_diffusion_gemma_vision_qk_rope_exact(
+    batch_size: int, seq_len: int, num_heads: int, head_dim: int
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(
+        20260918 + batch_size + seq_len + num_heads + head_dim
+    )
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    query = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+    key = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+    cosine = torch.randn(
+        batch_size,
+        seq_len,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    sine = torch.randn(
+        batch_size,
+        seq_len,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    position_ids = torch.zeros(batch_size, seq_len, 2, dtype=torch.long, device=device)
+
+    expected_query = apply_multidimensional_rope(
+        query, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    expected_key = apply_multidimensional_rope(
+        key, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    actual_query, actual_key = diffusion_gemma_vision_qk_rope(
+        query, key, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    assert torch.equal(actual_query, expected_query)
+    assert torch.equal(actual_key, expected_key)
+
+
+@torch.inference_mode()
+def test_diffusion_gemma_vision_rope_cpu_fallback() -> None:
+    generator = torch.Generator().manual_seed(20260918)
+    shape = (1, 7, 2, 8)
+    query = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
+    key = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
+    cosine = torch.randn(1, 7, 8, dtype=torch.bfloat16, generator=generator)
+    sine = torch.randn(1, 7, 8, dtype=torch.bfloat16, generator=generator)
+    position_ids = torch.zeros(1, 7, 2, dtype=torch.long)
+
+    expected_query = apply_multidimensional_rope(
+        query, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    expected_key = apply_multidimensional_rope(
+        key, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    actual_query, actual_key = diffusion_gemma_vision_qk_rope(
+        query, key, cosine, sine, position_ids, unsqueeze_dim=2
+    )
+    assert torch.equal(actual_query, expected_query)
+    assert torch.equal(actual_key, expected_key)
+
+
+@torch.inference_mode()
+def test_diffusion_gemma_vision_replacement_preserves_eval() -> None:
+    """Replacing an evaluated attention module must not enable dropout."""
+    config = Gemma4VisionConfig(
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        attention_dropout=0.5,
+    )
+    config._attn_implementation = "eager"
+    source = Gemma4VisionAttention(config, layer_idx=0).eval()
+    module = torch.nn.Sequential(source)
+    hidden = torch.randn(1, 7, 8)
+    embeddings = (torch.randn(1, 7, 4), torch.randn(1, 7, 4))
+    positions = torch.zeros(1, 7, 2, dtype=torch.long)
+    expected, _ = source(hidden, embeddings, position_ids=positions)
+
+    assert replace_diffusion_gemma_vision_attentions(module) == 1
+    assert not module[0].training
+    assert all(
+        actual is original
+        for actual, original in zip(module[0].parameters(), source.parameters())
+    )
+    actual, _ = module[0](hidden, embeddings, position_ids=positions)
+    assert torch.equal(actual, expected)

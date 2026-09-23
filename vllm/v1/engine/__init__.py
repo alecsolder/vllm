@@ -2,15 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -23,6 +25,9 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
 from vllm.v1.serial_utils import UtilityResult
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -167,6 +172,104 @@ class EngineCoreRequest(
         return self.pooling_params
 
 
+def is_grouped_read_tp_enabled(vllm_config: "VllmConfig") -> bool:
+    """Limit the experimental TP admission path to DiffusionGemma reads."""
+    parallel = vllm_config.parallel_config
+    if (
+        not (
+            parallel.tensor_parallel_size == 2
+            and os.environ.get("VLLM_DIFFUSION_GROUPED_READ_TP") == "1"
+            or parallel.tensor_parallel_size == 4
+            and os.environ.get("VLLM_DIFFUSION_GROUPED_READ_TP4") == "1"
+        )
+        or parallel.data_parallel_size != 1
+        or parallel.pipeline_parallel_size != 1
+        or parallel.enable_expert_parallel
+        or parallel.decode_context_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.enable_batch_sharded_sampling
+    ):
+        return False
+    model = vllm_config.model_config
+    return (
+        model is not None
+        and model.is_diffusion
+        and model.architectures == ["DiffusionGemmaForBlockDiffusion"]
+        and model.architecture == "DiffusionGemmaForBlockDiffusion"
+        and getattr(model.hf_config, "model_type", None) == "diffusion_gemma"
+        and vllm_config.diffusion_config is not None
+        and vllm_config.use_v2_model_runner
+    )
+
+
+MAX_ENGINE_CORE_BATCH_BYTES = 128 * 1024 * 1024
+
+
+class EngineCoreRequestBatch(msgspec.Struct, array_like=True):  # type: ignore[call-arg]
+    """One admission operation; execution may span multiple scheduler steps."""
+
+    call_id: int
+    client_index: int
+    requests: list[EngineCoreRequest]
+
+    def validate(self, vllm_config: "VllmConfig") -> None:
+        parallel = vllm_config.parallel_config
+        tp_reads = is_grouped_read_tp_enabled(vllm_config)
+        if (
+            parallel.data_parallel_size != 1
+            or (parallel.tensor_parallel_size != 1 and not tp_reads)
+            or parallel.pipeline_parallel_size != 1
+            or vllm_config.kv_transfer_config is not None
+            or vllm_config.ec_transfer_config is not None
+        ):
+            raise ValueError(
+                "Batch admission requires DP=TP=PP=1 without KV/encoder transfer."
+            )
+        if not 1 <= len(self.requests) <= envs.VLLM_MAX_N_SEQUENCES:
+            raise ValueError("Request batch is empty or exceeds the sequence limit.")
+        request_ids: set[str] = set()
+        for request in self.requests:
+            if not isinstance(request.request_id, str) or not request.request_id:
+                raise ValueError("Batch request IDs must be nonempty strings.")
+            if request.request_id in request_ids:
+                raise ValueError("Duplicate request ID in batch.")
+            request_ids.add(request.request_id)
+            params = request.sampling_params
+            if (
+                params is None
+                or params.n != 1
+                or request.pooling_params is not None
+                or request.resumable
+                or request.session_id is not None
+                or request.abort_immediately
+                or request.data_parallel_rank not in (None, 0)
+                or request.client_index != self.client_index
+            ):
+                raise ValueError(
+                    "Batch admission requires non-resumable generation children "
+                    "with n=1 on one client and engine."
+                )
+            extra = params.extra_args or {}
+            if tp_reads and (
+                extra.get("diffusion_read_only") is not True
+                or request.mm_features
+                or request.prompt_token_ids is None
+                or request.prompt_embeds is not None
+                or request.prompt_is_token_ids is not None
+            ):
+                raise ValueError(
+                    f"Experimental TP={parallel.tensor_parallel_size} batches require "
+                    "text-only DiffusionGemma reads."
+                )
+            if any(
+                extra.get(key) is not None
+                for key in ("kv_transfer_params", "ec_transfer_params")
+            ):
+                raise ValueError(
+                    "Batch admission does not support KV/encoder transfer."
+                )
+
+
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
 
@@ -295,6 +398,7 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
     WAKEUP = b"\x05"
+    ADD_BATCH = b"\x06"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):

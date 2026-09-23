@@ -5,7 +5,7 @@ import os
 import socket
 import time
 import warnings
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from copy import copy
 from typing import Any
 
@@ -41,9 +41,14 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
-from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine import (
+    EngineCoreRequest,
+    PauseMode,
+    is_grouped_read_tp_enabled,
+)
 from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -383,12 +388,17 @@ class AsyncLLM(EngineClient):
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        child_sampling_params: Sequence[SamplingParams] | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
         if self.errored:
             raise EngineDeadError()
 
         is_pooling = isinstance(params, PoolingParams)
+        if child_sampling_params is not None:
+            self._validate_child_sampling_params(
+                params, child_sampling_params, prompt, session_id
+            )
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
@@ -491,6 +501,22 @@ class AsyncLLM(EngineClient):
         # Use cloned params that may have been updated in process_inputs()
         params = request.params
 
+        if child_sampling_params is not None:
+            prompt_len = length_from_prompt_token_ids_or_embeds(
+                request.prompt_token_ids, request.prompt_embeds
+            )
+            supported_tasks = await self.get_supported_tasks()
+            normalized_children = tuple(
+                self.input_processor.process_child_sampling_params(
+                    child, prompt_len, supported_tasks
+                )
+                for child in child_sampling_params
+            )
+            await self._add_request_group(
+                request, prompt_text, normalized_children, queue
+            )
+            return queue
+
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_text, None, 0, queue)
             return queue
@@ -509,6 +535,108 @@ class AsyncLLM(EngineClient):
                 child_request, prompt_text, parent_request, idx, queue
             )
         return queue
+
+    def _validate_child_sampling_params(
+        self,
+        params: SamplingParams | PoolingParams,
+        children: Sequence[SamplingParams],
+        prompt: Any,
+        session_id: str | None,
+    ) -> None:
+        if (
+            not isinstance(params, SamplingParams)
+            or len(children) != params.n
+            or not children
+            or params.output_kind != RequestOutputKind.FINAL_ONLY
+            or any(
+                not isinstance(child, SamplingParams)
+                or child.n != 1
+                or child.output_kind != params.output_kind
+                for child in children
+            )
+        ):
+            raise VLLMValidationError(
+                "child_sampling_params requires n independent n=1 children "
+                "and FINAL_ONLY output."
+            )
+        parallel = self.vllm_config.parallel_config
+        tp_reads = is_grouped_read_tp_enabled(self.vllm_config) and all(
+            (child.extra_args or {}).get("diffusion_read_only") is True
+            for child in children
+        )
+        if tp_reads:
+            if isinstance(prompt, EngineCoreRequest):
+                tp_reads = (
+                    not prompt.mm_features
+                    and prompt.prompt_token_ids is not None
+                    and prompt.prompt_embeds is None
+                    and prompt.prompt_is_token_ids is None
+                )
+            elif isinstance(prompt, dict):
+                tp_reads = prompt.get("type", "token") == "token" and not any(
+                    key in prompt
+                    for key in (
+                        "multi_modal_data",
+                        "multi_modal_uuids",
+                        "mm_processor_kwargs",
+                        "media_io_kwargs",
+                        "prompt_embeds",
+                        "encoder_prompt",
+                        "decoder_prompt",
+                    )
+                )
+            else:
+                tp_reads = isinstance(prompt, str) or (
+                    isinstance(prompt, list) and all(type(x) is int for x in prompt)
+                )
+        if (
+            parallel.data_parallel_size != 1
+            or (parallel.tensor_parallel_size != 1 and not tp_reads)
+            or parallel.pipeline_parallel_size != 1
+            or self.vllm_config.kv_transfer_config is not None
+            or self.vllm_config.ec_transfer_config is not None
+            or session_id is not None
+            or isinstance(prompt, AsyncGenerator)
+            or (
+                isinstance(prompt, EngineCoreRequest)
+                and (prompt.resumable or prompt.session_id is not None)
+            )
+        ):
+            raise VLLMValidationError(
+                "Grouped child sampling requires a single engine with DP=TP=PP=1 "
+                "and no sessions, streaming input, or KV/encoder transfer."
+            )
+
+    async def _add_request_group(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        children: Sequence[SamplingParams],
+        queue: RequestOutputCollector,
+    ) -> None:
+        parent = ParentRequest(request, children)
+        if any(
+            self.output_processor.has_request(request_id)
+            or request_id in self.output_processor.parent_requests
+            for request_id in (parent.request_id, *parent.child_requests)
+        ):
+            raise VLLMValidationError("Grouped request ID is already registered.")
+        self.check_admission(parent.n, parent.request_id)
+        requests = []
+        try:
+            for index in range(parent.n):
+                child_id, child_params = parent.get_child_info(index)
+                child = copy(request)
+                child.request_id = child_id
+                child.sampling_params = child_params
+                self.output_processor.add_request(child, prompt, parent, index, queue)
+                requests.append(child)
+            await self.engine_core.add_requests_async(requests)
+        except BaseException:
+            # The transport owns in-flight admission cleanup. A rejected batch
+            # must not abort an existing core request with a colliding ID.
+            self.output_processor.abort_requests([parent.request_id], internal=True)
+            raise
 
     async def _add_request(
         self,
@@ -659,6 +787,7 @@ class AsyncLLM(EngineClient):
         session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        child_sampling_params: Sequence[SamplingParams] | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Main function called by the API server to kick off a request
             * 1) Making an AsyncStream corresponding to the Request.
@@ -700,6 +829,7 @@ class AsyncLLM(EngineClient):
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                child_sampling_params=child_sampling_params,
             )
 
             # The output_handler task pushes items into the queue.

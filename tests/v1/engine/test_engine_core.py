@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import queue
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import cache
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -21,14 +24,21 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.engine.arg_utils import EngineArgs
+from vllm.multimodal.cache import MultiModalCacheMissError
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
-from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
+from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestBatch, FinishReason
+from vllm.v1.engine.core import (
+    DPEngineCoreProc,
+    EngineCore,
+    EngineCoreProc,
+    EngineShutdownState,
+)
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import Request
 
 from ...utils import create_new_process_for_each_test, multi_gpu_test
 
@@ -36,23 +46,28 @@ if not current_platform.is_cuda():
     pytest.skip(reason="V1 currently only supported on CUDA.", allow_module_level=True)
 
 MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 # test_engine_core_concurrent_batches assumes exactly 12 tokens per prompt.
 # Adjust prompt if changing model to maintain 12-token length.
 PROMPT = "I am Gyoubu Masataka Oniwa"
-PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
 
 _REQUEST_COUNTER = 0
 
 
-def make_request() -> EngineCoreRequest:
+@cache
+def _prompt_tokens() -> list[int]:
+    return AutoTokenizer.from_pretrained(MODEL_NAME)(PROMPT).input_ids
+
+
+def make_request(prompt_token_ids: list[int] | None = None) -> EngineCoreRequest:
     global _REQUEST_COUNTER
     _REQUEST_COUNTER += 1
     request_id = f"request-{_REQUEST_COUNTER}"
     return EngineCoreRequest(
         request_id=request_id,
         external_req_id=f"{request_id}-{uuid.uuid4()}",
-        prompt_token_ids=PROMPT_TOKENS,
+        prompt_token_ids=_prompt_tokens()
+        if prompt_token_ids is None
+        else prompt_token_ids,
         mm_features=None,
         sampling_params=SamplingParams(),
         pooling_params=None,
@@ -61,6 +76,111 @@ def make_request() -> EngineCoreRequest:
         cache_salt=None,
         data_parallel_rank=None,
     )
+
+
+@pytest.fixture
+def batch_core():
+    core = object.__new__(EngineCoreProc)
+    core.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, tensor_parallel_size=1, pipeline_parallel_size=1
+        ),
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+    )
+    core.scheduler = MagicMock()
+    core.scheduler.requests = {}
+    core.scheduler.add_request.side_effect = lambda request: (
+        core.scheduler.requests.update({request.request_id: request})
+    )
+    core.scheduler.finish_requests.side_effect = lambda ids, _: [
+        core.scheduler.requests.pop(request_id) for request_id in ids
+    ]
+    core.mm_receiver_cache = None
+    core.request_block_hasher = None
+    core.shutdown_state = EngineShutdownState.RUNNING
+    core.output_queue = queue.Queue()
+    return core
+
+
+def _request_batch():
+    return EngineCoreRequestBatch(11, 0, [make_request([1, 2]) for _ in range(2)])
+
+
+def test_batch_admission_waits_for_every_preprocessed_child(batch_core, monkeypatch):
+    batch = _request_batch()
+    preprocess = batch_core.preprocess_add_request
+
+    def prepare(request):
+        assert not batch_core.scheduler.requests
+        assert batch_core.output_queue.empty()
+        return preprocess(request)
+
+    monkeypatch.setattr(batch_core, "preprocess_add_request", prepare)
+    prepared = batch_core._preprocess_request_batch(batch, 100)
+    assert len(prepared.requests) == 2
+    assert not batch_core.scheduler.requests
+    batch_core._handle_request_batch(prepared)
+    assert set(batch_core.scheduler.requests) == {r.request_id for r in batch.requests}
+    _, output = batch_core.output_queue.get_nowait()
+    assert output.utility_output.call_id == batch.call_id
+    assert output.utility_output.result.result is None
+    assert batch_core.output_queue.empty()
+
+
+@pytest.mark.parametrize(
+    "failure", ["preprocess", "cache", "insert", "shutdown", "collision"]
+)
+def test_batch_failure_does_not_leave_new_requests_or_abort_existing(
+    batch_core, monkeypatch, failure
+):
+    batch = _request_batch()
+    existing = None
+    if failure in ("preprocess", "cache"):
+        preprocess = batch_core.preprocess_add_request
+
+        def prepare(request):
+            if failure == "cache":
+                raise MultiModalCacheMissError([request.request_id])
+            if request is batch.requests[1]:
+                raise ValueError("invalid input")
+            return preprocess(request)
+
+        monkeypatch.setattr(batch_core, "preprocess_add_request", prepare)
+    prepared = batch_core._preprocess_request_batch(batch, 100)
+    if failure == "insert":
+        add = batch_core.add_request
+
+        def insert(request, wave):
+            add(request, wave)
+            if request.request_id == batch.requests[1].request_id:
+                raise ValueError("insertion failed after mutation")
+
+        monkeypatch.setattr(batch_core, "add_request", insert)
+    elif failure == "shutdown":
+        batch_core.shutdown_state = EngineShutdownState.REQUESTED
+    elif failure == "collision":
+        existing = Request.from_engine_core_request(batch.requests[0], None)
+        batch_core.scheduler.requests[existing.request_id] = existing
+    batch_core._handle_request_batch(prepared)
+    assert list(batch_core.scheduler.requests.values()) == (
+        [] if existing is None else [existing]
+    )
+    _, errors = batch_core.output_queue.get_nowait()
+    expected = {request.request_id for request in batch.requests}
+    if existing is not None:
+        expected.remove(existing.request_id)
+        batch_core.scheduler.finish_requests.assert_not_called()
+    assert {output.request_id for output in errors.outputs} == expected
+    assert all(output.finish_reason == FinishReason.ERROR for output in errors.outputs)
+    if failure == "cache":
+        assert all(
+            set(output.mm_cache_miss_hashes) == expected for output in errors.outputs
+        )
+    _, ack = batch_core.output_queue.get_nowait()
+    assert ack.utility_output.call_id == batch.call_id
+    assert ack.utility_output.result.result is not None
+    assert batch_core.output_queue.empty()
 
 
 @create_new_process_for_each_test()

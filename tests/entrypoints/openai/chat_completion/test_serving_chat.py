@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import json
+import math
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -44,6 +45,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.exceptions import QueueOverflowError, VLLMValidationError
 from vllm.inputs import TokensPrompt
+from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
@@ -138,8 +140,10 @@ def gptoss_speculative_server(default_server_args: list[str]):
     )
     server_args = default_server_args + [
         "--speculative-config",
-        f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
-        f'"method": "eagle3", "num_speculative_tokens": 3}}',
+        (
+            f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
+            f'"method": "eagle3", "num_speculative_tokens": 3}}'
+        ),
         f"--attention-backend={attention_backend}",
     ]
     # gpt-oss requires AITER unified attention on ROCm
@@ -669,6 +673,333 @@ async def _single_request_output(
     request_output: RequestOutput,
 ) -> AsyncIterator[RequestOutput]:
     yield request_output
+
+
+@pytest.mark.asyncio
+async def test_mean_answer_distribution_survives_reasoning_metadata_suppression():
+    """Hide generated reasoning/trace while retaining the requested answer mean."""
+    candidates = [[10, 11], [20, 21, 22]]
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "Shared state"}],
+            "n": 2,
+            "logprobs": True,
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "include_reasoning": False,
+            "diffusion_reads": [
+                {
+                    "seed_canvas": [9, 99, 0],
+                    "answer_positions": [1],
+                    "logprob_token_ids": ids,
+                    "answer_only_logprobs": True,
+                    "reasoning_positions": [0],
+                    "reasoning_forbidden_token_ids": [500],
+                    "steps": 4,
+                    "answer_pass_aggregation": "mean" if index else "last",
+                }
+                for index, ids in enumerate(candidates)
+            ],
+        }
+    )
+    output = _make_metrics_request_output()
+    output.outputs = [
+        CompletionOutput(
+            index=index,
+            text="reason then answer",
+            token_ids=[400, ids[0], 0],
+            cumulative_logprob=None,
+            finish_reason="stop",
+            logprobs=[
+                {token: Logprob(math.log(p)) for token, p in zip(ids, probabilities)}
+            ],
+        )
+        for index, (ids, probabilities) in enumerate(
+            zip(candidates, [[0.6, 0.4], [0.6, 0.3, 0.1]])
+        )
+    ]
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    parser = MagicMock()
+    parser.parse.return_value = ("generated private reason", "answer", [])
+    parser.count_reasoning_tokens.return_value = 1
+    response = await serving.chat_completion_full_generator(
+        request,
+        _single_request_output(output),
+        "chatcmpl-mean",
+        "test-model",
+        conversation=[],
+        tokenizer=MagicMock(),
+        parser=parser,
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-mean"),
+    )
+    assert isinstance(response, ChatCompletionResponse)
+    for choice in response.choices:
+        assert choice.message.reasoning is None
+        assert choice.token_ids is None
+        assert choice.logprobs is None
+    assert "diffusion_answer_distribution" not in response.choices[0].model_dump()
+    pooled = response.choices[1].diffusion_answer_distribution
+    assert pooled is not None
+    assert pooled.token_ids == [20, 21, 22]
+    assert pooled.probabilities == pytest.approx([0.6, 0.3, 0.1])
+    assert pooled.answer_passes == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer_only_logprobs", [False, True])
+@pytest.mark.parametrize("compact_answer_logprobs", [False, True])
+@pytest.mark.parametrize("flat_logprobs", [False, True])
+@pytest.mark.parametrize("variable_canvas", [False, True])
+@pytest.mark.parametrize("reason_mode", [False, True])
+async def test_diffusion_reads_serialize_each_choices_own_candidates(
+    answer_only_logprobs,
+    compact_answer_logprobs,
+    flat_logprobs,
+    variable_canvas,
+    reason_mode,
+):
+    """Six out-of-order children retain their heterogeneous candidate logprobs."""
+    candidates = [[10, 11], [10, 11], [20, 21, 22], [20, 21, 22], [30], [30]]
+    answer_positions = [index % 3 for index in range(len(candidates))]
+    seed_canvases = [
+        [9, 100 + index] + [0] * (index + 1 if variable_canvas else 1)
+        for index in range(len(candidates))
+    ]
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "Shared state"}],
+            "n": 6,
+            "logprobs": True,
+            "top_logprobs": None,
+            "return_tokens_as_token_ids": True,
+            "return_token_ids": reason_mode,
+            "diffusion_reads": [
+                {
+                    "seed_canvas": seed_canvases[index],
+                    "answer_positions": [answer_positions[index]],
+                    "logprob_token_ids": ids,
+                    "answer_only_logprobs": answer_only_logprobs,
+                    **(
+                        {
+                            "reasoning_positions": [
+                                (answer_positions[index] + 1)
+                                % len(seed_canvases[index])
+                            ],
+                            "reasoning_forbidden_token_ids": [500],
+                        }
+                        if reason_mode
+                        else {}
+                    ),
+                }
+                for index, ids in enumerate(candidates)
+            ],
+        }
+    )
+    output = _make_metrics_request_output()
+    output.outputs = []
+    for index in [5, 1, 3, 0, 4, 2]:
+        token_ids = seed_canvases[index].copy()
+        position = answer_positions[index]
+        token_ids[position] = candidates[index][0]
+        if reason_mode:
+            token_ids[(position + 1) % len(token_ids)] = 400 + index
+        answer_logprobs = {
+            token: Logprob(-1.0 - rank) for rank, token in enumerate(candidates[index])
+        }
+        if answer_only_logprobs and compact_answer_logprobs:
+            logprobs = [answer_logprobs]
+        else:
+            logprobs = [{token: Logprob(-0.1)} for token in token_ids]
+            logprobs[position] = answer_logprobs
+        if flat_logprobs:
+            flat = FlatLogprobs()
+            flat.extend(logprobs)
+            logprobs = flat
+        output.outputs.append(
+            CompletionOutput(
+                index=index,
+                text="answer",
+                token_ids=token_ids,
+                cumulative_logprob=None,
+                logprobs=logprobs,
+                finish_reason="stop",
+            )
+        )
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    response = await serving.chat_completion_full_generator(
+        request,
+        _single_request_output(output),
+        "chatcmpl-diffusion",
+        "test-model",
+        conversation=[],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-diffusion"),
+    )
+    assert isinstance(response, ChatCompletionResponse)
+    assert {choice.index for choice in response.choices} == set(range(6))
+    for choice in response.choices:
+        assert choice.logprobs is not None
+        assert choice.logprobs.content is not None
+        position = answer_positions[choice.index]
+        if reason_mode:
+            expected = seed_canvases[choice.index].copy()
+            expected[position] = candidates[choice.index][0]
+            expected[(position + 1) % len(expected)] = 400 + choice.index
+            assert choice.token_ids == expected
+        output_position = 0 if answer_only_logprobs else position
+        assert [
+            row.token for row in choice.logprobs.content[output_position].top_logprobs
+        ] == [f"token_id:{token}" for token in candidates[choice.index]]
+        if answer_only_logprobs:
+            assert len(choice.logprobs.content) == 1
+        else:
+            assert len(choice.logprobs.content) == len(seed_canvases[choice.index])
+            for index, row in enumerate(choice.logprobs.content):
+                if index != position:
+                    assert [entry.token for entry in row.top_logprobs] == [row.token]
+                    assert row.logprob == pytest.approx(-0.1)
+    assert response.usage.prompt_tokens == 3
+    assert response.usage.completion_tokens == sum(map(len, seed_canvases))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canvas_length", [3, 5])
+@pytest.mark.parametrize(
+    "reason_mode,answer_only", [(False, True), (True, True), (True, False)]
+)
+@pytest.mark.parametrize(
+    "token_ids,message",
+    [
+        ([8, 10, 0], "changed a fixed canvas token"),
+        ([9, 10], "invalid canvas"),
+        ([9, 10, 666], "forbidden reasoning token"),
+    ],
+)
+async def test_answer_only_logprobs_validate_fixed_canvas_before_compacting(
+    token_ids, message, canvas_length, reason_mode, answer_only
+):
+    if message == "forbidden reasoning token" and not reason_mode:
+        message = "changed a fixed canvas token"
+    token_ids = token_ids + [0] * (canvas_length - 3)
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "Shared state"}],
+            "n": 1,
+            "logprobs": True,
+            "return_tokens_as_token_ids": True,
+            "diffusion_reads": [
+                {
+                    "seed_canvas": [9, 100] + [0] * (canvas_length - 2),
+                    "answer_positions": [1],
+                    "logprob_token_ids": [10, 11],
+                    "answer_only_logprobs": answer_only,
+                    **(
+                        {
+                            "reasoning_positions": [2],
+                            "reasoning_forbidden_token_ids": [666],
+                        }
+                        if reason_mode
+                        else {}
+                    ),
+                }
+            ],
+        }
+    )
+    output = _make_metrics_request_output()
+    output.outputs = [
+        CompletionOutput(
+            index=0,
+            text="",
+            token_ids=token_ids,
+            cumulative_logprob=None,
+            logprobs=FlatLogprobs(
+                start_indices=[0],
+                end_indices=[2],
+                token_ids=[10, 11],
+                logprobs=[-0.2, -1.7],
+                ranks=[1, 2],
+                decoded_tokens=[None] * 2,
+            ),
+            finish_reason="stop",
+        )
+    ]
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    with pytest.raises(ValueError, match=message):
+        await serving.chat_completion_full_generator(
+            request,
+            _single_request_output(output),
+            "chatcmpl-diffusion",
+            "test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=RequestResponseMetadata(request_id="chatcmpl-diffusion"),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_header", [False, True])
+@pytest.mark.parametrize("child_count", [1, 2])
+async def test_diffusion_reads_pass_children_once_or_reject_session_header(
+    session_header,
+    child_count,
+):
+    """The shared prompt is rendered once; session headers never reach the engine."""
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.renderer = MagicMock()
+    serving.model_config = MockModelConfig()
+    serving.models = MagicMock()
+    serving.models.model_name.return_value = "test-model"
+    serving.engine_client = MagicMock()
+    serving.has_kv_connector = False
+    serving.default_sampling_params = {}
+    serving.override_max_tokens = None
+    serving._effective_chat_template_kwargs = MagicMock(return_value={})
+    serving._maybe_get_adapters = MagicMock(return_value=None)
+    serving._log_inputs = MagicMock()
+    serving.render_chat_request = AsyncMock(
+        return_value=([], [{"type": "tokens", "prompt_token_ids": [1, 2, 3]}])
+    )
+    serving.chat_completion_full_generator = AsyncMock(return_value="result")
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "Shared state"}],
+            "n": child_count,
+            "max_tokens": 3,
+            "logprobs": True,
+            "diffusion_reads": [
+                {
+                    "seed_canvas": [9, 100 + index, 0],
+                    "answer_positions": [1],
+                    "logprob_token_ids": [10 + index],
+                    "self_conditioning_scope": "canvas" if index else "answer",
+                }
+                for index in range(child_count)
+            ],
+        }
+    )
+    raw_request = MagicMock()
+    raw_request.headers = {"X-Session-ID": "session"} if session_header else {}
+    if session_header:
+        with pytest.raises(VLLMValidationError, match="session headers"):
+            await serving.create_chat_completion(request, raw_request)
+        serving.render_chat_request.assert_not_called()
+        serving.engine_client.generate.assert_not_called()
+    else:
+        assert await serving.create_chat_completion(request) == "result"
+        serving.render_chat_request.assert_awaited_once()
+        serving.engine_client.generate.assert_called_once()
+        args, kwargs = serving.engine_client.generate.call_args
+        assert args[1].n == child_count
+        assert [child.n for child in kwargs["child_sampling_params"]] == [
+            1
+        ] * child_count
+        assert [
+            child.logprob_token_ids for child in kwargs["child_sampling_params"]
+        ] == [[10 + index] for index in range(child_count)]
+        assert [
+            child.extra_args["diffusion_read_self_conditioning_scope"]
+            for child in kwargs["child_sampling_params"]
+        ] == ["canvas" if index else "answer" for index in range(child_count)]
 
 
 async def _stream_request_outputs(

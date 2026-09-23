@@ -3,7 +3,7 @@
 
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -81,7 +81,7 @@ def _validate(enable_trace_replay: bool) -> None:
             return_sampling_mask=False,
             enable_trace_replay=enable_trace_replay,
         ),
-        vllm_config=SimpleNamespace(reasoning_config=None),
+        vllm_config=SimpleNamespace(reasoning_config=None, diffusion_config=None),
         speculative_config=None,
         structured_outputs_config=None,
         tokenizer=None,
@@ -108,3 +108,48 @@ def test_trace_replay_requires_v2_model_runner():
 
     with pytest.raises(ValueError, match="trace replay requires Model Runner V2"):
         VllmConfig._verify_trace_replay_config(config)
+
+
+def test_child_normalization_owns_nested_params_even_with_skip_clone():
+    processor = InputProcessor.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(max_model_len=512)
+    processor.renderer = SimpleNamespace(tokenizer=None, get_eos_token_id=lambda: 2)
+    processor.generation_config_fields = {}
+    processor._validate_params = MagicMock()
+    params = SamplingParams(skip_clone=True, extra_args={"canvas": [4, 5]})
+    params.max_tokens = None
+    child = processor.process_child_sampling_params(params, 100, ("generate",))
+    assert child.max_tokens == 412
+    assert params.max_tokens is None
+    child.extra_args["canvas"].append(6)
+    assert params.extra_args == {"canvas": [4, 5]}
+    processor._validate_params.assert_called_once_with(child, ("generate",))
+
+
+def test_child_read_rejects_incomplete_canvas_instead_of_truncating():
+    processor = InputProcessor.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(max_model_len=512)
+    processor._validate_params = MagicMock()
+    params = SamplingParams(max_tokens=256, extra_args={"diffusion_read_only": True})
+    with pytest.raises(VLLMValidationError, match="complete canvas"):
+        processor.process_child_sampling_params(params, 257, ("generate",))
+
+
+@pytest.mark.parametrize("canvas_length", [4, 5])
+def test_child_read_canvas_must_fit_a_single_scheduled_batch(canvas_length):
+    """Reject reads that could never fit, including when model context suffices."""
+    processor = InputProcessor.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(max_model_len=512)
+    processor.scheduler_config = SimpleNamespace(max_num_batched_tokens=4)
+    processor.renderer = SimpleNamespace(tokenizer=None, get_eos_token_id=lambda: 2)
+    processor.generation_config_fields = {}
+    processor._validate_params = MagicMock()
+    params = SamplingParams(
+        max_tokens=canvas_length, extra_args={"diffusion_read_only": True}
+    )
+    if canvas_length > 4:
+        with pytest.raises(VLLMValidationError, match="max_num_batched_tokens"):
+            processor.process_child_sampling_params(params, 100, ("generate",))
+    else:
+        child = processor.process_child_sampling_params(params, 100, ("generate",))
+        assert child.max_tokens == canvas_length

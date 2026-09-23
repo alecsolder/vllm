@@ -4,6 +4,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
+from copy import deepcopy
 from typing import Annotated, Any, ClassVar, Literal
 
 from openai.types.chat.chat_completion_audio import (
@@ -11,9 +12,15 @@ from openai.types.chat.chat_completion_audio import (
 )
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
 from pydantic import (
+    BaseModel,
+    ConfigDict,
     Field,
     PrivateAttr,
     SerializeAsAny,
+    StrictBool,
+    StrictInt,
+    ValidatorFunctionWrapHandler,
+    field_validator,
     model_serializer,
     model_validator,
 )
@@ -43,6 +50,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
+    MAX_LOGPROB_TOKEN_IDS,
     BeamSearchParams,
     RepetitionDetectionParams,
     RequestOutputKind,
@@ -96,6 +104,16 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: list[ChatCompletionLogProbsContent] | None = None
 
 
+class DiffusionAnswerDistribution(OpenAIBaseModel):
+    aggregation: Literal["mean"] = "mean"
+    normalization: Literal["allowed_token_ids"] = "allowed_token_ids"
+    answer_passes: int
+    answer_position: int
+    token_ids: list[int]
+    probabilities: list[float]
+    log_probabilities: list[float]
+
+
 class ChatCompletionResponseChoice(OpenAIBaseModel):
     index: int
     # ``SerializeAsAny`` lets pydantic honor subclasses of ``ChatMessage``
@@ -105,6 +123,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # ``ChatMessage`` instances serialize identically to before.
     message: SerializeAsAny[ChatMessage]
     logprobs: ChatCompletionLogProbs | None = None
+    diffusion_answer_distribution: DiffusionAnswerDistribution | None = None
     # per OpenAI spec this is the default
     finish_reason: str | None = "stop"
     # not part of the OpenAI spec but included in vLLM for legacy reasons
@@ -122,6 +141,13 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.diffusion_answer_distribution is None:
+            data.pop("diffusion_answer_distribution", None)
+        return data
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -208,6 +234,130 @@ class ChatCompletionNamedFunction(OpenAIBaseModel):
 class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     function: ChatCompletionNamedFunction
     type: Literal["function"] = "function"
+
+
+class DiffusionReadSpec(BaseModel):
+    """One canvas with a constrained answer and an optional reasoning span."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seed_canvas: list[Annotated[StrictInt, Field(ge=0)]] = Field(min_length=1)
+    answer_positions: list[Annotated[StrictInt, Field(ge=0)]] = Field(
+        min_length=1, max_length=1
+    )
+    logprob_token_ids: list[Annotated[StrictInt, Field(ge=0)]] = Field(
+        min_length=1, max_length=MAX_LOGPROB_TOKEN_IDS
+    )
+    answer_only_logprobs: bool = False
+    steps: StrictInt = Field(default=1, ge=1, le=32)
+    answer_pass_aggregation: Literal["last", "mean"] = "last"
+    self_conditioning: StrictBool = True
+    self_conditioning_scope: Literal["answer", "canvas"] = "answer"
+    reasoning_positions: list[Annotated[StrictInt, Field(ge=0)]] | None = Field(
+        default=None, min_length=1
+    )
+    reasoning_forbidden_token_ids: list[Annotated[StrictInt, Field(ge=0)]] | None = None
+    reasoning_steps: StrictInt | None = Field(default=None, ge=1, le=64)
+    reasoning_convergence_stop: StrictBool = False
+    reasoning_seed: StrictInt | None = Field(default=None, ge=0, le=2**64 - 1)
+    reasoning_known_positions: list[Annotated[StrictInt, Field(ge=0)]] | None = Field(
+        default=None, min_length=1, strict=True
+    )
+    reasoning_delayed_suffix_positions: (
+        list[Annotated[StrictInt, Field(ge=0)]] | None
+    ) = Field(default=None, min_length=1, strict=True)
+    reasoning_answer_noise: Literal["candidates", "vocab"] | None = None
+    reasoning_token_noise: Literal["allowed", "vocab"] | None = None
+    reasoning_token_proposals: Literal["allowed", "vocab"] | None = None
+    reasoning_schedule_steps: StrictInt | None = Field(default=None, ge=1)
+    reasoning_entropy_bound: (
+        Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] | None
+    ) = None
+    reasoning_round_feedback_logits: StrictBool = False
+    reasoning_preserve_feedback: StrictBool = False
+    reasoning_answer_feedback: StrictBool = False
+    reasoning_unmasked_feedback: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_answer(self) -> "DiffusionReadSpec":
+        if self.answer_positions[0] >= len(self.seed_canvas):
+            raise ValueError("answer_positions must be within seed_canvas")
+        if len(set(self.logprob_token_ids)) != len(self.logprob_token_ids):
+            raise ValueError("logprob_token_ids must be unique")
+        positions = self.reasoning_positions
+        if self.answer_pass_aggregation == "mean" and (
+            positions is None
+            or not self.answer_only_logprobs
+            or self.reasoning_preserve_feedback
+        ):
+            raise ValueError(
+                "Mean answer reads require reasoning, answer-only logprobs, "
+                "and reasoning_preserve_feedback=False"
+            )
+        if positions is None:
+            if (
+                self.reasoning_forbidden_token_ids is not None
+                or self.reasoning_steps is not None
+                or self.reasoning_convergence_stop
+                or self.reasoning_seed is not None
+                or self.reasoning_known_positions is not None
+                or self.reasoning_delayed_suffix_positions is not None
+                or self.reasoning_answer_noise is not None
+                or self.reasoning_token_noise is not None
+                or self.reasoning_token_proposals is not None
+                or self.reasoning_schedule_steps is not None
+                or self.reasoning_entropy_bound is not None
+                or self.reasoning_round_feedback_logits
+                or self.reasoning_preserve_feedback
+                or self.reasoning_answer_feedback
+                or self.reasoning_unmasked_feedback
+            ):
+                raise ValueError("Reasoning options require reasoning_positions")
+            return self
+        if (
+            positions[-1] >= len(self.seed_canvas)
+            or positions != sorted(set(positions))
+            or set(positions).intersection(self.answer_positions)
+        ):
+            raise ValueError(
+                "reasoning_positions must be strictly increasing within seed_canvas "
+                "and disjoint from answer_positions"
+            )
+        forbidden = self.reasoning_forbidden_token_ids
+        known = self.reasoning_known_positions
+        if known is not None and (
+            known[-1] >= len(self.seed_canvas)
+            or known != sorted(set(known))
+            or set(known).intersection((*positions, *self.answer_positions))
+        ):
+            raise ValueError(
+                "reasoning_known_positions must be strictly increasing within "
+                "seed_canvas and disjoint from reasoning and answer positions"
+            )
+        delayed = self.reasoning_delayed_suffix_positions
+        if delayed is not None and (
+            delayed[0] <= positions[-1]
+            or delayed[-1] >= len(self.seed_canvas)
+            or delayed != sorted(set(delayed))
+            or set(delayed).intersection(self.answer_positions)
+        ):
+            raise ValueError(
+                "reasoning_delayed_suffix_positions must be strictly increasing "
+                "within seed_canvas, after all reasoning positions and disjoint "
+                "from answer_positions"
+            )
+        if forbidden is None or len(set(forbidden)) != len(forbidden):
+            raise ValueError(
+                "reasoning_forbidden_token_ids must be supplied and unique"
+            )
+        if self.reasoning_schedule_steps is not None and (
+            self.reasoning_schedule_steps
+            < (self.reasoning_steps if self.reasoning_steps is not None else 8)
+        ):
+            raise ValueError(
+                "reasoning_schedule_steps must be at least reasoning_steps"
+            )
+        return self
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
@@ -499,6 +649,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    diffusion_reads: list[DiffusionReadSpec] | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "One single-answer diffusion canvas per output, in choice-index order. "
+            "Requires n to match the number of canvases and logprobs=True. "
+            "Streaming, beam search, transfers, and sessions are unsupported."
+        ),
+    )
+
     repetition_detection: RepetitionDetectionParams | None = Field(
         default=None,
         description="Parameters for detecting repetitive N-gram patterns "
@@ -520,6 +680,231 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
 
     # --8<-- [end:chat-completion-extra-params]
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_known_positions(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_known_positions"
+        if isinstance(value, dict) and name in value:
+            positions = value[name]
+            if positions is None:
+                return handler(
+                    {key: item for key, item in value.items() if key != name}
+                )
+            if not isinstance(positions, list) or any(
+                type(pos) is not int for pos in positions
+            ):
+                raise VLLMValidationError(
+                    f"{name} must be a list of integer positions or null.",
+                    parameter=f"vllm_xargs.{name}",
+                )
+        return handler(value)
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_delayed_suffix_positions(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_delayed_suffix_positions"
+        if isinstance(value, dict) and name in value:
+            positions = value[name]
+            if positions is None:
+                return handler(
+                    {key: item for key, item in value.items() if key != name}
+                )
+            if not isinstance(positions, list) or any(
+                type(pos) is not int for pos in positions
+            ):
+                raise VLLMValidationError(
+                    f"{name} must be a list of integer positions or null.",
+                    parameter=f"vllm_xargs.{name}",
+                )
+        return handler(value)
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_seed(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        name = "diffusion_reasoning_seed"
+        if isinstance(value, dict) and name in value:
+            seed = value[name]
+            if seed is None:
+                return handler(
+                    {key: item for key, item in value.items() if key != name}
+                )
+            if type(seed) is not int or not 0 <= seed < 2**64:
+                raise VLLMValidationError(
+                    f"{name} must be an unsigned 64-bit integer or null.",
+                    parameter=f"vllm_xargs.{name}",
+                )
+        return handler(value)
+
+    @field_validator("vllm_xargs", mode="wrap")
+    @classmethod
+    def preserve_reasoning_feedback_booleans(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        feedback = {}
+        if isinstance(value, dict):
+            for name in (
+                "diffusion_reasoning_round_feedback_logits",
+                "diffusion_reasoning_preserve_feedback",
+                "diffusion_reasoning_answer_feedback",
+                "diffusion_reasoning_unmasked_feedback",
+                "diffusion_reasoning_convergence_stop",
+            ):
+                if name in value:
+                    if type(value[name]) is not bool:
+                        raise VLLMValidationError(
+                            f"{name} must be a boolean.",
+                            parameter=f"vllm_xargs.{name}",
+                        )
+                    feedback[name] = value[name]
+        parsed = handler(value)
+        if feedback:
+            parsed.update(feedback)
+        return parsed
+
+    @field_validator("vllm_xargs", mode="before")
+    @classmethod
+    def validate_reasoning_token_noise(cls, value: Any) -> Any:
+        name = "diffusion_reasoning_token_noise"
+        if (
+            isinstance(value, dict)
+            and name in value
+            and (
+                type(value[name]) is not str or value[name] not in ("allowed", "vocab")
+            )
+        ):
+            raise VLLMValidationError(
+                f"{name} must be 'allowed' or 'vocab'.",
+                parameter=f"vllm_xargs.{name}",
+            )
+        return value
+
+    @field_validator("vllm_xargs", mode="before")
+    @classmethod
+    def validate_reasoning_token_proposals(cls, value: Any) -> Any:
+        name = "diffusion_reasoning_token_proposals"
+        if (
+            isinstance(value, dict)
+            and name in value
+            and (
+                type(value[name]) is not str or value[name] not in ("allowed", "vocab")
+            )
+        ):
+            raise VLLMValidationError(
+                f"{name} must be 'allowed' or 'vocab'.",
+                parameter=f"vllm_xargs.{name}",
+            )
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_boolean_reasoning_controls(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        xargs = data.get("vllm_xargs")
+        if isinstance(xargs, dict):
+            for name in (
+                "diffusion_reasoning_schedule_steps",
+                "diffusion_reasoning_entropy_bound",
+            ):
+                if isinstance(xargs.get(name), bool):
+                    raise VLLMValidationError(
+                        f"{name} must be numeric, not boolean.",
+                        parameter=f"vllm_xargs.{name}",
+                    )
+        return data
+
+    @model_validator(mode="after")
+    def validate_diffusion_reads(self) -> "ChatCompletionRequest":
+        if (
+            self.vllm_xargs is not None
+            and "diffusion_answer_pass_aggregation" in self.vllm_xargs
+        ):
+            raise VLLMValidationError(
+                "answer_pass_aggregation is supported only within diffusion_reads.",
+                parameter="vllm_xargs.diffusion_answer_pass_aggregation",
+            )
+        if self.diffusion_reads is None:
+            return self
+        n = self.n if self.n is not None else 1
+        if len(self.diffusion_reads) != n:
+            raise VLLMValidationError(
+                "diffusion_reads must contain exactly n canvases.",
+                parameter="diffusion_reads",
+            )
+        if not self.logprobs:
+            raise VLLMValidationError(
+                "diffusion_reads requires logprobs=True.",
+                parameter="logprobs",
+            )
+        unsupported = {
+            "stream": bool(self.stream),
+            "use_beam_search": self.use_beam_search,
+            "logprob_token_ids": self.logprob_token_ids is not None,
+            "top_logprobs": self.top_logprobs not in (None, 0),
+            "kv_transfer_params": self.kv_transfer_params is not None,
+            "ec_transfer_params": self.ec_transfer_params is not None,
+            "session_id": self.session_id is not None,
+            "truncate_prompt_tokens": self.truncate_prompt_tokens is not None,
+            "reasoning_effort": self.reasoning_effort not in (None, "none"),
+        }
+        for name, present in unsupported.items():
+            if present:
+                raise VLLMValidationError(
+                    f"diffusion_reads does not support {name}.", parameter=name
+                )
+        chat_kwargs = self.chat_template_kwargs or {}
+        if (
+            "enable_thinking" in chat_kwargs
+            and chat_kwargs["enable_thinking"] is not False
+        ):
+            raise VLLMValidationError(
+                "diffusion_reads requires enable_thinking=False when supplied.",
+                parameter="chat_template_kwargs.enable_thinking",
+            )
+        conflicting_xargs = {
+            "diffusion_read_only",
+            "diffusion_seed_canvas",
+            "diffusion_answer_positions",
+            "diffusion_answer_only_logprobs",
+            "diffusion_read_steps",
+            "diffusion_answer_pass_aggregation",
+            "diffusion_read_self_conditioning",
+            "diffusion_read_self_conditioning_scope",
+            "diffusion_reasoning_positions",
+            "diffusion_reasoning_forbidden_token_ids",
+            "diffusion_reasoning_steps",
+            "diffusion_reasoning_convergence_stop",
+            "diffusion_reasoning_seed",
+            "diffusion_reasoning_known_positions",
+            "diffusion_reasoning_delayed_suffix_positions",
+            "diffusion_reasoning_answer_noise",
+            "diffusion_reasoning_token_noise",
+            "diffusion_reasoning_token_proposals",
+            "diffusion_reasoning_schedule_steps",
+            "diffusion_reasoning_entropy_bound",
+            "diffusion_reasoning_round_feedback_logits",
+            "diffusion_reasoning_preserve_feedback",
+            "diffusion_reasoning_answer_feedback",
+            "diffusion_reasoning_unmasked_feedback",
+            "diffusion_canvas_length",
+            "diffusion_max_steps",
+            "kv_transfer_params",
+            "ec_transfer_params",
+            "session_id",
+        }
+        if conflicting_xargs.intersection(self.vllm_xargs or {}):
+            raise VLLMValidationError(
+                "diffusion_reads conflicts with diffusion, transfer, or session xargs.",
+                parameter="vllm_xargs",
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -594,7 +979,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # enable_thinking to false). For templates that don't declare the
         # variable, resolve_chat_template_kwargs filters it out harmlessly.
         user_kwargs = self.chat_template_kwargs or {}
-        if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
+        if self.diffusion_reads is not None:
+            extra_kwargs["enable_thinking"] = False
+        elif self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
             extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
 
         return ChatParams(
@@ -760,6 +1147,94 @@ class ChatCompletionRequest(OpenAIBaseModel):
             repetition_detection=self.repetition_detection,
             routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
+
+    def to_child_sampling_params(
+        self, sampling_params: SamplingParams
+    ) -> tuple[SamplingParams, ...] | None:
+        """Build independent child parameters without changing the shared parent."""
+        if self.diffusion_reads is None:
+            return None
+        children = []
+        for read in self.diffusion_reads:
+            if (
+                sampling_params.max_tokens is None
+                or len(read.seed_canvas) > sampling_params.max_tokens
+            ):
+                raise VLLMValidationError(
+                    "Each diffusion_reads canvas must contain at most max_tokens "
+                    "tokens; every complete canvas must fit within max_model_len.",
+                    parameter="diffusion_reads",
+                )
+            child = deepcopy(sampling_params)
+            child.n = 1
+            child.max_tokens = len(read.seed_canvas)
+            optimize_token_output = bool(
+                self.return_tokens_as_token_ids and read.answer_only_logprobs
+            )
+            child.detokenize = not optimize_token_output
+            child.flat_logprobs = optimize_token_output
+            child.logprobs = None
+            child.logprob_token_ids = list(read.logprob_token_ids)
+            child.extra_args = {
+                **(child.extra_args or {}),
+                "diffusion_read_only": True,
+                "diffusion_seed_canvas": list(read.seed_canvas),
+                "diffusion_answer_positions": list(read.answer_positions),
+                "diffusion_answer_only_logprobs": read.answer_only_logprobs,
+                "diffusion_read_steps": read.steps,
+                "diffusion_read_self_conditioning": read.self_conditioning,
+                "diffusion_read_self_conditioning_scope": read.self_conditioning_scope,
+            }
+            if read.answer_pass_aggregation == "mean":
+                child.extra_args["diffusion_answer_pass_aggregation"] = "mean"
+            if read.reasoning_positions is not None:
+                assert read.reasoning_forbidden_token_ids is not None
+                child.extra_args.update(
+                    diffusion_reasoning_positions=list(read.reasoning_positions),
+                    diffusion_reasoning_forbidden_token_ids=list(
+                        read.reasoning_forbidden_token_ids
+                    ),
+                    diffusion_reasoning_steps=(
+                        read.reasoning_steps if read.reasoning_steps is not None else 8
+                    ),
+                    diffusion_reasoning_answer_noise=(
+                        read.reasoning_answer_noise or "candidates"
+                    ),
+                )
+                if read.reasoning_schedule_steps is not None:
+                    child.extra_args["diffusion_reasoning_schedule_steps"] = (
+                        read.reasoning_schedule_steps
+                    )
+                if read.reasoning_convergence_stop:
+                    child.extra_args["diffusion_reasoning_convergence_stop"] = True
+                if read.reasoning_token_noise == "vocab":
+                    child.extra_args["diffusion_reasoning_token_noise"] = "vocab"
+                if read.reasoning_token_proposals == "vocab":
+                    child.extra_args["diffusion_reasoning_token_proposals"] = "vocab"
+                if read.reasoning_seed is not None:
+                    child.extra_args["diffusion_reasoning_seed"] = read.reasoning_seed
+                if read.reasoning_known_positions is not None:
+                    child.extra_args["diffusion_reasoning_known_positions"] = list(
+                        read.reasoning_known_positions
+                    )
+                if read.reasoning_delayed_suffix_positions is not None:
+                    child.extra_args["diffusion_reasoning_delayed_suffix_positions"] = (
+                        list(read.reasoning_delayed_suffix_positions)
+                    )
+                if read.reasoning_entropy_bound is not None:
+                    child.extra_args["diffusion_reasoning_entropy_bound"] = (
+                        read.reasoning_entropy_bound
+                    )
+                if read.reasoning_round_feedback_logits:
+                    child.extra_args["diffusion_reasoning_round_feedback_logits"] = True
+                if read.reasoning_preserve_feedback:
+                    child.extra_args["diffusion_reasoning_preserve_feedback"] = True
+                if read.reasoning_answer_feedback:
+                    child.extra_args["diffusion_reasoning_answer_feedback"] = True
+                if read.reasoning_unmasked_feedback:
+                    child.extra_args["diffusion_reasoning_unmasked_feedback"] = True
+            children.append(child)
+        return tuple(children)
 
     @model_validator(mode="before")
     @classmethod

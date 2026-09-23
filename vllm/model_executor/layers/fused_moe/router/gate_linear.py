@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
@@ -118,6 +119,7 @@ class GateLinear(ReplicatedLinear):
             and self.out_dtype == torch.float32
         )
 
+        # Batch-invariant mode keeps the cuBLAS path across token counts.
         # cuteDSL ll_bf16_gemm eligibility. Any dims supported, but SM90+ required bc:
         # 1. PDL support. Both dot-product and split-K kernels.
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
@@ -130,6 +132,7 @@ class GateLinear(ReplicatedLinear):
             self.allow_ll_bf16_gemm = (
                 self.weight.dtype == torch.bfloat16
                 and self.out_dtype == torch.float32
+                and not envs.VLLM_BATCH_INVARIANT
                 and is_available()
             )
 
@@ -159,6 +162,7 @@ class GateLinear(ReplicatedLinear):
             self.allow_ll_bf16_gemm = (
                 self.weight.dtype == torch.bfloat16
                 and out_dtype == torch.float32
+                and not envs.VLLM_BATCH_INVARIANT
                 and is_available()
             )
 
